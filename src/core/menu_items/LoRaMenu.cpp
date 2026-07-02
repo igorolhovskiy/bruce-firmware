@@ -4,13 +4,15 @@
 #include "core/utils.h"
 #include "modules/lora/LoRaRF.h"
 #include "modules/lora/LoRaRecon.h"
+#include "modules/lora/Meshtastic.h"
 
 void LoRaMenu::optionsMenu() {
     options = {
-        {"Chat",             []() { lorachat(); }      },
-        {"Recon",            []() { loraRecon(); }     },
-        {"Change username",  []() { changeusername(); }},
-        {"Change Frequency", []() { chfreq(); }        },
+        {"Chat",             []() { lorachat(); }         },
+        {"Recon",            []() { loraRecon(); }        },
+        {"Meshtastic",       []() { meshtasticChannel(); }},
+        {"Change username",  []() { changeusername(); }   },
+        {"Change Frequency", []() { chfreq(); }           },
     };
     addOptionToMainMenu();
     String txt = "LoRa";
