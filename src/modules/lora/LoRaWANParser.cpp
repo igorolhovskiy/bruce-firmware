@@ -332,7 +332,7 @@ std::vector<String> describeLoRaWANFrame(const LoRaWANFrame &frame) {
 
     // Data frame
     char addrBuf[16];
-    snprintf(addrBuf, sizeof(addrBuf), "0x%08X", frame.devAddr);
+    snprintf(addrBuf, sizeof(addrBuf), "0x%08lX", (unsigned long)frame.devAddr);
     String addrLine = "DevAddr " + String(addrBuf);
     String hint = loRaWANOperatorHint(frame.devAddr);
     if (hint.length()) addrLine += " (" + hint + ")";
