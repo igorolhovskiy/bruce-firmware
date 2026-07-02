@@ -126,3 +126,29 @@ not a labeled Esc** — Bruce maps `keyValue == 0x08` → `KeyStroke.del` → `E
   frames before trusting Phase 5's sweep engine end-to-end. The user has Meshtastic tooling
   installed (`meshtastic`, `mesh-analysis`, `mesh-tunnel` in `.pyproject`) but no node was
   on hand at test time — worth asking again later.
+
+## Phase 4 (parser + self-test) — DONE
+
+Added `src/modules/lora/LoRaWANParser.{h,cpp}`: decodes MHDR/DevAddr/FCtrl/FCnt/FOpts (1.0.x
+plaintext, by CID, direction-aware Req/Ans)/FPort/JoinEUI/DevEUI/DevNonce; FRMPayload kept as
+opaque length+pointer only; MIC bytes extracted, never validated. `runLoRaWANParserSelfTest()`
+runs the Appendix A vectors (+ truncated-data/truncated-join/proprietary edge cases) every time
+the Recon screen opens — **verified PASSED on-device** (serial: "self-test PASSED
+(join-request, unconfirmed-up, confirmed-up, truncated + proprietary edge cases)"; on-screen
+green "parser self-test: OK", both user-confirmed).
+
+## Phase 5 (sweep/lock engine) — DONE
+
+State machine cycles 8 EU868 channels x SF7-12 per the dwell table (400s/full sweep), parks
+on RX2 (869.525MHz/SF12, inverted IQ) between sweeps, retunes the already-running radio
+in place (`standby → setFrequency/setSpreadingFactor/invertIQ → startReceive`, never a
+transmit call). Lock mode (fix SF, hop channels — the brief's recommended variant) toggles on
+the trackball's center/Select button. **Verified on hardware:** serial shows the sweep
+advancing on schedule (channel 2/8 SF12 appeared ~58s in, matching dwell-table math), lock
+toggle logs correctly, on-screen "CH x/8 freq SF" status line updates live.
+
+**Still open:** live-capture-during-sweep hasn't been confirmed with a real transmitter (same
+gap as Phase 3 — no Meshtastic node/LoRaWAN device was available this session). Worth revisiting
+once one is on hand, since the sweep's per-combo stats (packet count, last RSSI, last DevAddr)
+and the RX2 counter are currently untested against live traffic, only against the state-machine
+timing itself.
