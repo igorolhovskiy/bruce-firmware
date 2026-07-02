@@ -3,10 +3,12 @@
 #include "LoRaWANParser.h"
 #include "core/configPins.h"
 #include "core/display.h"
+#include "core/mykeyboard.h"
 #include "modules/lora/LoRaRF.h"
 #include <Arduino.h>
 #include <RadioLib.h>
 #include <globals.h>
+#include <vector>
 
 extern BruceConfigPins bruceConfigPins;
 
@@ -19,6 +21,7 @@ constexpr uint8_t RECON_SYNC_WORD = 0x34; // LoRaWAN public sync word
 constexpr size_t RECON_PREAMBLE = 8;
 constexpr uint32_t HEARTBEAT_MS = 3000;
 constexpr uint32_t REDRAW_MS = 250;
+constexpr uint32_t SHORTCUT_POLL_MS = 80; // checkLetterShortcutPress() is not free; throttle it
 
 // §8 EU868 channel plan: 8 uplink channels, one RX2 downlink channel.
 constexpr float EU868_CHANNELS_MHZ[8] = {867.1f, 867.3f, 867.5f, 867.7f, 867.9f, 868.1f, 868.3f, 868.5f};
@@ -36,6 +39,27 @@ constexpr SfDwell SF_DWELL_TABLE[] = {
 };
 constexpr size_t SF_DWELL_COUNT = sizeof(SF_DWELL_TABLE) / sizeof(SF_DWELL_TABLE[0]);
 constexpr uint32_t RX2_DWELL_MS = 20000; // reuse the SF12 dwell for the periodic RX2 park
+constexpr size_t SWEEP_TABLE_ROWS = EU868_CHANNEL_COUNT * SF_DWELL_COUNT + 1; // +1 RX2 row
+
+// SX1262 sensitivity floors, BW125/CR4:5 (§8) - for link-margin, never "distance".
+float sensitivityFloorDbm(uint8_t sf) {
+    switch (sf) {
+    case 7: return -123.0f;
+    case 8: return -126.0f;
+    case 9: return -129.0f;
+    case 10: return -132.0f;
+    case 11: return -135.0f;
+    default: return -137.0f; // SF12
+    }
+}
+float linkMarginDb(float rssi, uint8_t sf) { return rssi - sensitivityFloorDbm(sf); }
+String marginAssessment(float marginDb) {
+    if (marginDb >= 40) return "very close / strong signal";
+    if (marginDb >= 20) return "strong signal";
+    if (marginDb >= 10) return "moderate signal";
+    if (marginDb >= 5) return "weak - near edge of range";
+    return "very weak - at the edge of range";
+}
 
 struct ComboStats {
     uint32_t packetCount = 0;
@@ -44,23 +68,53 @@ struct ComboStats {
     bool hasLastDevAddr = false;
 };
 
+constexpr size_t MAX_CAPTURED_FRAMES = 40;
+struct CapturedFrame {
+    uint32_t seq = 0;
+    uint32_t capturedAtMs = 0;
+    float freqMHz = 0;
+    uint8_t sf = 0;
+    float bwKHz = RECON_BW_KHZ;
+    float rssi = 0;
+    float snr = 0;
+    float airtimeMs = 0;
+    size_t rawLen = 0;
+    uint8_t raw[255];
+    bool crcOk = true;
+    bool isRx2 = false;
+    LoRaWANFrame decoded;
+};
+
 SPIClass *reconSpi = nullptr;
 Module *reconModule = nullptr;
 SX1262 *reconRadio = nullptr;
 volatile bool reconIrqEnabled = true;
 volatile bool reconPacketReceived = false;
 uint32_t reconPacketCount = 0;
-String lastFrameSummary = "no frames yet";
 
 enum class SweepStage { Channel, Rx2 };
 SweepStage sweepStage = SweepStage::Channel;
 size_t sweepChannelIdx = 0;
 size_t sweepSfIdx = 0;
 uint32_t stageStartMs = 0;
-bool lockEnabled = false;
-size_t lockedSfIdx = 0; // meaningful only while lockEnabled
+enum class LockMode { None, Sf, Rx2 };
+LockMode lockMode = LockMode::None;
+size_t lockedSfIdx = 0; // meaningful only while lockMode == Sf
 ComboStats comboStats[EU868_CHANNEL_COUNT][SF_DWELL_COUNT];
 uint32_t rx2PacketCount = 0;
+std::vector<CapturedFrame> capturedFrames; // newest at back()
+
+enum class ViewMode { Sweep, FrameList, FrameDetail };
+ViewMode viewMode = ViewMode::Sweep;
+int sweepCursor = 0; // 0..SWEEP_TABLE_ROWS-1 (last row = RX2)
+int sweepScrollTop = 0;
+int frameListCursor = 0; // 0 = newest
+int frameListScrollTop = 0;
+size_t detailFrameIdx = 0;
+int detailScroll = 0;
+bool needsRedraw = true;
+bool viewNeedsFullClear = true; // set on every view transition; drawn once, not on every periodic refresh
+bool exitFeatureRequested = false;
 
 void IRAM_ATTR onReconPacket() {
     if (!reconIrqEnabled) return;
@@ -119,7 +173,7 @@ void enterChannel(size_t chIdx, size_t sfIdx) {
     Serial.printf(
         "[LoRaRecon] sweep -> channel %u/%u %.3fMHz SF%u%s\n", (unsigned)(chIdx + 1),
         (unsigned)EU868_CHANNEL_COUNT, EU868_CHANNELS_MHZ[chIdx], SF_DWELL_TABLE[sfIdx].sf,
-        lockEnabled ? " [LOCKED]" : ""
+        lockMode == LockMode::Sf ? " [LOCKED]" : ""
     );
 }
 
@@ -132,15 +186,18 @@ void enterRx2() {
 
 uint32_t currentDwellMs() {
     if (sweepStage == SweepStage::Rx2) return RX2_DWELL_MS;
-    return SF_DWELL_TABLE[lockEnabled ? lockedSfIdx : sweepSfIdx].dwellMs;
+    return SF_DWELL_TABLE[lockMode == LockMode::Sf ? lockedSfIdx : sweepSfIdx].dwellMs;
 }
 
+// Called only when the current dwell has elapsed; never called while
+// lockMode == Rx2 (updateSweep() skips the whole time-based check then, so
+// the radio stays genuinely parked on RX2 until the user unlocks it).
 void advanceSweep() {
     if (sweepStage == SweepStage::Rx2) {
-        enterChannel(0, lockEnabled ? lockedSfIdx : 0);
+        enterChannel(0, lockMode == LockMode::Sf ? lockedSfIdx : 0);
         return;
     }
-    if (lockEnabled) {
+    if (lockMode == LockMode::Sf) {
         // Recommended lock mode: fix SF, keep hopping channels.
         size_t nextCh = sweepChannelIdx + 1;
         if (nextCh >= EU868_CHANNEL_COUNT) {
@@ -164,19 +221,35 @@ void advanceSweep() {
 }
 
 void updateSweep() {
+    if (lockMode == LockMode::Rx2) return; // parked indefinitely until unlocked - no time-based advance
     if (millis() - stageStartMs >= currentDwellMs()) advanceSweep();
 }
 
-void toggleLock() {
-    lockEnabled = !lockEnabled;
-    if (lockEnabled) {
-        lockedSfIdx = (sweepStage == SweepStage::Channel) ? sweepSfIdx : 0;
-        Serial.printf(
-            "[LoRaRecon] LOCK enabled: SF%u fixed, hopping channels only\n", SF_DWELL_TABLE[lockedSfIdx].sf
-        );
-    } else {
+// Toggles the "hop channels at a fixed SF" lock mode, freezing at whatever
+// SF is highlighted right now (Screen A "select to lock").
+void toggleLockAt(size_t sfIdx) {
+    if (lockMode == LockMode::Sf && lockedSfIdx == sfIdx) {
+        lockMode = LockMode::None;
         Serial.println("[LoRaRecon] LOCK disabled: resuming full channel x SF sweep");
+        return;
     }
+    lockMode = LockMode::Sf;
+    lockedSfIdx = sfIdx;
+    Serial.printf("[LoRaRecon] LOCK enabled: SF%u fixed, hopping channels only\n", SF_DWELL_TABLE[sfIdx].sf);
+}
+
+// Toggles a genuine RX2 lock: parks the radio on RX2 indefinitely (no
+// automatic return to the sweep) until the user selects the RX2 row again.
+void toggleRx2Lock() {
+    if (lockMode == LockMode::Rx2) {
+        lockMode = LockMode::None;
+        Serial.println("[LoRaRecon] RX2 lock disabled: resuming full channel x SF sweep");
+        enterChannel(0, 0);
+        return;
+    }
+    lockMode = LockMode::Rx2;
+    enterRx2();
+    Serial.println("[LoRaRecon] RX2 lock enabled: parked indefinitely on RX2 (869.525MHz SF12, inverted IQ)");
 }
 
 void resetStats() {
@@ -185,7 +258,7 @@ void resetStats() {
     }
     rx2PacketCount = 0;
     reconPacketCount = 0;
-    lastFrameSummary = "no frames yet";
+    capturedFrames.clear();
     Serial.println("[LoRaRecon] stats reset");
 }
 
@@ -282,7 +355,7 @@ void processReconPacket() {
         }
 
         if (sweepStage == SweepStage::Channel) {
-            ComboStats &cs = comboStats[sweepChannelIdx][lockEnabled ? lockedSfIdx : sweepSfIdx];
+            ComboStats &cs = comboStats[sweepChannelIdx][lockMode == LockMode::Sf ? lockedSfIdx : sweepSfIdx];
             cs.packetCount++;
             cs.lastRssi = rssi;
             if (decoded.isDataFrame) {
@@ -293,14 +366,413 @@ void processReconPacket() {
             rx2PacketCount++;
         }
 
-        lastFrameSummary = "#" + String(reconPacketCount) + " " + decoded.mtypeName + " rssi=" +
-                            String(rssi, 1) + "dBm" + (crcOk ? "" : " CRC!");
+        CapturedFrame cf;
+        cf.seq = reconPacketCount;
+        cf.capturedAtMs = millis();
+        cf.freqMHz = (sweepStage == SweepStage::Rx2) ? RX2_FREQ_MHZ : EU868_CHANNELS_MHZ[sweepChannelIdx];
+        cf.sf = (sweepStage == SweepStage::Rx2) ? RX2_SF : SF_DWELL_TABLE[lockMode == LockMode::Sf ? lockedSfIdx : sweepSfIdx].sf;
+        cf.rssi = rssi;
+        cf.snr = snr;
+        cf.airtimeMs = airtimeMs;
+        cf.rawLen = len;
+        memcpy(cf.raw, buf, len);
+        cf.crcOk = crcOk;
+        cf.isRx2 = (sweepStage == SweepStage::Rx2);
+        cf.decoded = decoded;
+        // decoded.frmPayloadPtr points into the transient `buf` above; relocate
+        // it into cf.raw (a byte-identical, permanently-owned copy) so it stays
+        // valid after this function returns. FRMPayload itself is never
+        // decoded/displayed - only kept as opaque length+pointer, per spec.
+        if (decoded.frmPayloadPtr) { cf.decoded.frmPayloadPtr = cf.raw + (decoded.frmPayloadPtr - buf); }
+        capturedFrames.push_back(cf);
+        if (capturedFrames.size() > MAX_CAPTURED_FRAMES) capturedFrames.erase(capturedFrames.begin());
+
+        if (viewMode == ViewMode::Sweep) needsRedraw = true; // reflect new packet count promptly
     } else {
         Serial.printf("[LoRaRecon] RX read failed: %d\n", state);
     }
 
     reconRadio->startReceive();
     reconIrqEnabled = true;
+}
+
+// ---------------------------------------------------------------------------
+// Screen A - sweep / activity table
+// ---------------------------------------------------------------------------
+
+void handleSweepInput() {
+    if (check(PrevPress) || check(UpPress)) {
+        if (sweepCursor > 0) sweepCursor--;
+        needsRedraw = true;
+    }
+    if (check(NextPress) || check(DownPress)) {
+        if (sweepCursor < (int)SWEEP_TABLE_ROWS - 1) sweepCursor++;
+        needsRedraw = true;
+    }
+    if (check(SelPress)) {
+        if (sweepCursor == (int)SWEEP_TABLE_ROWS - 1) {
+            toggleRx2Lock();
+        } else {
+            size_t sfIdx = sweepCursor % SF_DWELL_COUNT;
+            size_t chIdx = sweepCursor / SF_DWELL_COUNT;
+            toggleLockAt(sfIdx);
+            if (lockMode == LockMode::Sf) enterChannel(chIdx, sfIdx); // jump immediately to the selected combo
+        }
+        needsRedraw = true;
+    }
+    if (check(EscPress)) {
+        exitFeatureRequested = true;
+        return;
+    }
+
+    static uint32_t lastShortcutCheck = 0;
+    if (millis() - lastShortcutCheck > SHORTCUT_POLL_MS) {
+        lastShortcutCheck = millis();
+        char c = checkLetterShortcutPress();
+        if (c == 'f' || c == 'F') {
+            viewMode = ViewMode::FrameList;
+            frameListCursor = 0;
+            frameListScrollTop = 0;
+            viewNeedsFullClear = true;
+            needsRedraw = true;
+        } else if (c == 'r' || c == 'R') {
+            resetStats();
+            needsRedraw = true;
+        }
+    }
+}
+
+// Cache of what's currently drawn in each visible screen-row slot, so a
+// periodic refresh only touches rows whose content actually changed instead
+// of blindly re-filling+re-drawing all ~18 rows every cycle (that redundant
+// redraw was the remaining source of visible flicker).
+constexpr size_t MAX_VISIBLE_SWEEP_ROWS = 24;
+String sweepRowCache[MAX_VISIBLE_SWEEP_ROWS];
+String sweepLockLineCache;
+
+void drawSweepScreen() {
+    constexpr int rowH = 11;
+    constexpr int listTop = 30;
+    const int listBottom = tftHeight - 14;
+    const int visibleRows = (listBottom - listTop) / rowH;
+
+    // Static chrome (title/footer/divider) is drawn once per view-entry, not
+    // on every periodic refresh - repeatedly fillScreen()-ing on a timer was
+    // causing a visible flash even with no new data.
+    if (viewNeedsFullClear) {
+        viewNeedsFullClear = false;
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextSize(FM);
+        tft.setTextColor(bruceConfig.priColor, TFT_BLACK);
+        tft.drawCentreString("LoRa Recon - Sweep", tftWidth / 2, 4, 1);
+        tft.setTextSize(FP);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.drawFastHLine(0, tftHeight - 13, tftWidth, TFT_DARKGREY);
+        tft.drawString("Up/Dn nav Sel=lock f=frames r=reset Bksp=exit", 2, tftHeight - 11, 1);
+        for (auto &c : sweepRowCache) c = "\x01"; // force every row slot to redraw this pass
+        sweepLockLineCache = "\x01"; // force lock-status line to redraw this pass
+    }
+    tft.setTextSize(FP);
+
+    // Dedicated, always-visible lock-status line - lock state was previously
+    // only shown via small per-row 'L' markers, which read as "sweeping got
+    // stuck" rather than "lock is intentionally on". Redrawn whenever the
+    // lock state text changes (not just on full clear), independent of the
+    // row-list redraw below.
+    String lockLine;
+    if (lockMode == LockMode::Sf) {
+        lockLine = "LOCK: SF" + String(SF_DWELL_TABLE[lockedSfIdx].sf) + " (hopping channels only)";
+    } else if (lockMode == LockMode::Rx2) {
+        lockLine = "LOCK: RX2 (parked - not sweeping)";
+    } else {
+        lockLine = "LOCK: off (sweeping all channels x SF)";
+    }
+    if (lockLine != sweepLockLineCache) {
+        sweepLockLineCache = lockLine;
+        tft.fillRect(0, 17, tftWidth, rowH, TFT_BLACK);
+        tft.setTextColor(lockMode != LockMode::None ? TFT_YELLOW : TFT_DARKGREY, TFT_BLACK);
+        tft.drawString(lockLine, 2, 17, 1);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    }
+
+    if (sweepCursor < sweepScrollTop) sweepScrollTop = sweepCursor;
+    if (sweepCursor >= sweepScrollTop + visibleRows) sweepScrollTop = sweepCursor - visibleRows + 1;
+    if (sweepScrollTop < 0) sweepScrollTop = 0;
+
+    for (int row = 0; row < visibleRows; row++) {
+        int idx = sweepScrollTop + row;
+        int y = listTop + row * rowH;
+        if (idx >= (int)SWEEP_TABLE_ROWS) {
+            tft.fillRect(0, y, tftWidth, rowH, TFT_BLACK);
+            continue;
+        }
+        bool isCursor = (idx == sweepCursor);
+        bool isRx2Row = (idx == (int)SWEEP_TABLE_ROWS - 1);
+        bool isActive;
+        char line[48];
+
+        if (isRx2Row) {
+            isActive = (sweepStage == SweepStage::Rx2);
+            snprintf(
+                line, sizeof(line), "%c%cRX2  %.3f SF%-2u n=%-4lu", isActive ? '>' : ' ',
+                lockMode == LockMode::Rx2 ? 'L' : ' ', RX2_FREQ_MHZ, RX2_SF, (unsigned long)rx2PacketCount
+            );
+        } else {
+            size_t chIdx = idx / SF_DWELL_COUNT;
+            size_t sfIdx = idx % SF_DWELL_COUNT;
+            const ComboStats &cs = comboStats[chIdx][sfIdx];
+            isActive = (sweepStage == SweepStage::Channel && chIdx == sweepChannelIdx &&
+                        sfIdx == (lockMode == LockMode::Sf ? lockedSfIdx : sweepSfIdx));
+            bool isLockedSf = lockMode == LockMode::Sf && sfIdx == lockedSfIdx;
+            char rssiBuf[6];
+            if (cs.packetCount) snprintf(rssiBuf, sizeof(rssiBuf), "%-4.0f", cs.lastRssi);
+            else snprintf(rssiBuf, sizeof(rssiBuf), "  --");
+            char addrBuf[10];
+            if (cs.hasLastDevAddr) snprintf(addrBuf, sizeof(addrBuf), "%08lX", (unsigned long)cs.lastDevAddr);
+            else snprintf(addrBuf, sizeof(addrBuf), "--------");
+            snprintf(
+                line, sizeof(line), "%c%c%.3f SF%-2u n=%-4lu %s %s", isActive ? '>' : ' ',
+                isLockedSf ? 'L' : ' ', EU868_CHANNELS_MHZ[chIdx], SF_DWELL_TABLE[sfIdx].sf,
+                (unsigned long)cs.packetCount, rssiBuf, addrBuf
+            );
+        }
+
+        String key = String(isCursor ? 'C' : '.') + line;
+        if (row < (int)MAX_VISIBLE_SWEEP_ROWS && sweepRowCache[row] == key) continue; // unchanged, skip redraw
+        if (row < (int)MAX_VISIBLE_SWEEP_ROWS) sweepRowCache[row] = key;
+
+        uint16_t bg = isCursor ? bruceConfig.priColor : TFT_BLACK;
+        tft.fillRect(0, y, tftWidth, rowH, bg);
+        tft.setTextColor(isCursor ? bruceConfig.bgColor : (isActive ? TFT_GREEN : TFT_WHITE), bg);
+        tft.drawString(line, 2, y, 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Screen B - captured frames list
+// ---------------------------------------------------------------------------
+
+const char *mtypeShortCode(LoRaWANMType mtype) {
+    switch (mtype) {
+    case LoRaWANMType::JoinRequest: return "JReq";
+    case LoRaWANMType::JoinAccept: return "JAcc";
+    case LoRaWANMType::UnconfirmedDataUp: return "UpU ";
+    case LoRaWANMType::UnconfirmedDataDown: return "DnU ";
+    case LoRaWANMType::ConfirmedDataUp: return "UpC ";
+    case LoRaWANMType::ConfirmedDataDown: return "DnC ";
+    case LoRaWANMType::RejoinRequest: return "Rejn";
+    default: return "Prop";
+    }
+}
+
+void handleFrameListInput() {
+    if (check(EscPress)) {
+        viewMode = ViewMode::Sweep;
+        viewNeedsFullClear = true;
+        needsRedraw = true;
+        return;
+    }
+    if (capturedFrames.empty()) return;
+
+    if (check(PrevPress) || check(UpPress)) {
+        if (frameListCursor > 0) frameListCursor--;
+        needsRedraw = true;
+    }
+    if (check(NextPress) || check(DownPress)) {
+        if (frameListCursor < (int)capturedFrames.size() - 1) frameListCursor++;
+        needsRedraw = true;
+    }
+    if (check(SelPress)) {
+        detailFrameIdx = capturedFrames.size() - 1 - frameListCursor; // newest-first cursor -> storage index
+        detailScroll = 0;
+        viewMode = ViewMode::FrameDetail;
+        viewNeedsFullClear = true;
+        needsRedraw = true;
+    }
+}
+
+void drawFrameListScreen() {
+    constexpr int rowH = 11;
+    constexpr int listTop = 22;
+    const int listBottom = tftHeight - 14;
+    const int visibleRows = (listBottom - listTop) / rowH;
+
+    if (viewNeedsFullClear) {
+        viewNeedsFullClear = false;
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextSize(FM);
+        tft.setTextColor(bruceConfig.priColor, TFT_BLACK);
+        tft.drawCentreString("LoRa Recon - Frames", tftWidth / 2, 4, 1);
+        tft.setTextSize(FP);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.drawFastHLine(0, tftHeight - 13, tftWidth, TFT_DARKGREY);
+        tft.drawString(capturedFrames.empty() ? "Bksp=back" : "Up/Dn nav Sel=detail Bksp=back", 2, tftHeight - 11, 1);
+    }
+    tft.setTextSize(FP);
+
+    if (capturedFrames.empty()) {
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.drawCentreString("No frames captured yet", tftWidth / 2, tftHeight / 2, 1);
+        return;
+    }
+
+    const int total = (int)capturedFrames.size();
+
+    if (frameListCursor < frameListScrollTop) frameListScrollTop = frameListCursor;
+    if (frameListCursor >= frameListScrollTop + visibleRows) frameListScrollTop = frameListCursor - visibleRows + 1;
+    if (frameListScrollTop < 0) frameListScrollTop = 0;
+
+    for (int row = 0; row < visibleRows; row++) {
+        int cursorIdx = frameListScrollTop + row; // 0 = newest
+        int y = listTop + row * rowH;
+        if (cursorIdx >= total) {
+            tft.fillRect(0, y, tftWidth, rowH, TFT_BLACK);
+            continue;
+        }
+        size_t storeIdx = total - 1 - cursorIdx;
+        const CapturedFrame &f = capturedFrames[storeIdx];
+        bool isCursor = (cursorIdx == frameListCursor);
+        bool anomaly = f.decoded.anomalyReplayedDevNonce || f.decoded.anomalyFcntRegression;
+
+        char idStr[10];
+        if (f.decoded.isJoinRequest) {
+            snprintf(
+                idStr, sizeof(idStr), "%02X%02X%02X%02X", f.decoded.devEUI[0], f.decoded.devEUI[1],
+                f.decoded.devEUI[2], f.decoded.devEUI[3]
+            );
+        } else if (f.decoded.isDataFrame) {
+            snprintf(idStr, sizeof(idStr), "%08lX", (unsigned long)f.decoded.devAddr);
+        } else {
+            snprintf(idStr, sizeof(idStr), "--------");
+        }
+
+        uint32_t ageS = (millis() - f.capturedAtMs) / 1000;
+        char line[48];
+        snprintf(
+            line, sizeof(line), "%c%5lus %s %s %-4.0fdBm", anomaly ? '!' : ' ', (unsigned long)ageS,
+            mtypeShortCode(f.decoded.mtype), idStr, f.rssi
+        );
+
+        uint16_t bg = isCursor ? bruceConfig.priColor : TFT_BLACK;
+        tft.fillRect(0, y, tftWidth, rowH, bg);
+        tft.setTextColor(isCursor ? bruceConfig.bgColor : (anomaly ? TFT_RED : TFT_WHITE), bg);
+        tft.drawString(line, 2, y, 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Screen C - frame detail (human-readable)
+// ---------------------------------------------------------------------------
+
+std::vector<String> wrapLine(const String &text, size_t maxChars) {
+    std::vector<String> out;
+    if (text.length() == 0) {
+        out.push_back("");
+        return out;
+    }
+    int start = 0;
+    int len = text.length();
+    while (start < len) {
+        int remaining = len - start;
+        if (remaining <= (int)maxChars) {
+            out.push_back(text.substring(start));
+            break;
+        }
+        int breakAt = start + maxChars;
+        int lastSpace = text.lastIndexOf(' ', breakAt);
+        if (lastSpace <= start) lastSpace = breakAt; // no space to break on - hard break
+        out.push_back(text.substring(start, lastSpace));
+        start = lastSpace + 1;
+    }
+    return out;
+}
+
+std::vector<String> buildDetailLines(const CapturedFrame &f) {
+    std::vector<String> logical;
+    logical.push_back("-- RF --");
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Freq %.3f MHz  SF%u  BW%.0fkHz", f.freqMHz, f.sf, f.bwKHz);
+    logical.push_back(buf);
+    snprintf(buf, sizeof(buf), "RSSI %.1f dBm   SNR %.1f dB", f.rssi, f.snr);
+    logical.push_back(buf);
+    float margin = linkMarginDb(f.rssi, f.sf);
+    logical.push_back(
+        "Link margin " + String(margin, 1) + " dB - " + marginAssessment(margin) + " (not distance - depends on "
+                                                                                     "the sender's TX power/antenna)"
+    );
+    snprintf(buf, sizeof(buf), "Length %u bytes   Airtime %.2f ms", (unsigned)f.rawLen, f.airtimeMs);
+    logical.push_back(buf);
+    if (!f.crcOk) logical.push_back("PHY CRC: MISMATCH - frame may be corrupted");
+    if (f.isRx2) logical.push_back("Captured on RX2 (downlink) - inverted IQ");
+    logical.push_back("");
+    logical.push_back("-- Protocol --");
+    for (const String &l : describeLoRaWANFrame(f.decoded)) logical.push_back(l);
+
+    std::vector<String> wrapped;
+    for (auto &l : logical) {
+        for (auto &w : wrapLine(l, 50)) wrapped.push_back(w);
+    }
+    return wrapped;
+}
+
+void handleFrameDetailInput() {
+    if (check(EscPress)) {
+        viewMode = ViewMode::FrameList;
+        viewNeedsFullClear = true;
+        needsRedraw = true;
+        return;
+    }
+    if (check(PrevPress) || check(UpPress)) {
+        if (detailScroll > 0) detailScroll--;
+        needsRedraw = true;
+    }
+    if (check(NextPress) || check(DownPress)) {
+        detailScroll++; // clamped in drawFrameDetailScreen()
+        needsRedraw = true;
+    }
+}
+
+void drawFrameDetailScreen() {
+    constexpr int rowH = 11;
+    constexpr int top = 22;
+    const int bottom = tftHeight - 14;
+    const int visibleRows = (bottom - top) / rowH;
+
+    if (viewNeedsFullClear) {
+        viewNeedsFullClear = false;
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextSize(FM);
+        tft.setTextColor(bruceConfig.priColor, TFT_BLACK);
+        tft.drawCentreString("LoRa Recon - Detail", tftWidth / 2, 4, 1);
+        tft.setTextSize(FP);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+        tft.drawFastHLine(0, tftHeight - 13, tftWidth, TFT_DARKGREY);
+        tft.drawString(
+            detailFrameIdx >= capturedFrames.size() ? "Bksp=back" : "Up/Dn scroll  Bksp=back", 2, tftHeight - 11, 1
+        );
+    }
+    tft.setTextSize(FP);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+    if (detailFrameIdx >= capturedFrames.size()) {
+        tft.drawCentreString("Frame no longer available", tftWidth / 2, tftHeight / 2, 1);
+        return;
+    }
+
+    std::vector<String> lines = buildDetailLines(capturedFrames[detailFrameIdx]);
+
+    int maxScroll = (int)lines.size() - visibleRows;
+    if (maxScroll < 0) maxScroll = 0;
+    if (detailScroll > maxScroll) detailScroll = maxScroll;
+    if (detailScroll < 0) detailScroll = 0;
+
+    for (int row = 0; row < visibleRows; row++) {
+        int idx = detailScroll + row;
+        int y = top + row * rowH;
+        tft.fillRect(0, y, tftWidth, rowH, TFT_BLACK);
+        if (idx >= (int)lines.size()) continue;
+        tft.drawString(lines[idx], 2, y, 1);
+    }
 }
 
 } // namespace
@@ -324,9 +796,18 @@ void loraRecon() {
         selfTestOk ? "parser self-test: OK" : "parser self-test: FAILED", tftWidth / 2, tftHeight / 2 - 6, 1
     );
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    delay(600); // brief, so the self-test result is actually readable before the sweep view takes over
 
     resetStats();
-    lockEnabled = false;
+    lockMode = LockMode::None;
+    viewMode = ViewMode::Sweep;
+    sweepCursor = 0;
+    sweepScrollTop = 0;
+    frameListCursor = 0;
+    frameListScrollTop = 0;
+    needsRedraw = true;
+    viewNeedsFullClear = true;
+    exitFeatureRequested = false;
 
     if (!startReconRadio()) {
         while (true) {
@@ -337,8 +818,8 @@ void loraRecon() {
     enterChannel(0, 0);
 
     uint32_t lastHeartbeat = millis();
-    uint32_t lastRedraw = 0;
-    while (true) {
+    uint32_t lastSweepRedraw = 0;
+    while (!exitFeatureRequested) {
         processReconPacket();
         updateSweep();
 
@@ -350,31 +831,27 @@ void loraRecon() {
             );
         }
 
-        if (millis() - lastRedraw > REDRAW_MS) {
-            lastRedraw = millis();
-            tft.fillRect(0, tftHeight / 2 + 4, tftWidth, 60, TFT_BLACK);
-            tft.setTextColor(TFT_WHITE, TFT_BLACK);
-
-            char sweepLine[48];
-            if (sweepStage == SweepStage::Rx2) {
-                snprintf(sweepLine, sizeof(sweepLine), "RX2  %.3fMHz  SF%u", RX2_FREQ_MHZ, RX2_SF);
-            } else {
-                snprintf(
-                    sweepLine, sizeof(sweepLine), "CH %u/%u  %.3fMHz  SF%u%s", (unsigned)(sweepChannelIdx + 1),
-                    (unsigned)EU868_CHANNEL_COUNT, EU868_CHANNELS_MHZ[sweepChannelIdx],
-                    SF_DWELL_TABLE[lockEnabled ? lockedSfIdx : sweepSfIdx].sf, lockEnabled ? " LOCK" : ""
-                );
+        switch (viewMode) {
+        case ViewMode::Sweep:
+            handleSweepInput();
+            if (millis() - lastSweepRedraw > REDRAW_MS) {
+                lastSweepRedraw = millis();
+                needsRedraw = true;
             }
-            tft.drawCentreString(sweepLine, tftWidth / 2, tftHeight / 2 + 6, 1);
-
-            char countLine[24];
-            snprintf(countLine, sizeof(countLine), "Packets: %lu", (unsigned long)reconPacketCount);
-            tft.drawCentreString(countLine, tftWidth / 2, tftHeight / 2 + 18, 1);
-            tft.drawCentreString(lastFrameSummary, tftWidth / 2, tftHeight / 2 + 30, 1);
+            break;
+        case ViewMode::FrameList: handleFrameListInput(); break;
+        case ViewMode::FrameDetail: handleFrameDetailInput(); break;
         }
 
-        if (check(SelPress)) toggleLock();
-        if (check(EscPress)) break;
+        if (needsRedraw) {
+            switch (viewMode) {
+            case ViewMode::Sweep: drawSweepScreen(); break;
+            case ViewMode::FrameList: drawFrameListScreen(); break;
+            case ViewMode::FrameDetail: drawFrameDetailScreen(); break;
+            }
+            needsRedraw = false;
+        }
+
         delay(5);
     }
 
