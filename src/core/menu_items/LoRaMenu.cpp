@@ -3,10 +3,12 @@
 #include "core/display.h"
 #include "core/utils.h"
 #include "modules/lora/LoRaRF.h"
+#include "modules/lora/LoRaRecon.h"
 
 void LoRaMenu::optionsMenu() {
     options = {
         {"Chat",             []() { lorachat(); }      },
+        {"Recon",            []() { loraRecon(); }     },
         {"Change username",  []() { changeusername(); }},
         {"Change Frequency", []() { chfreq(); }        },
     };
