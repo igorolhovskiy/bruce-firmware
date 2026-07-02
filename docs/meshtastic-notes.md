@@ -273,6 +273,15 @@ it. Revisit with a real node/app on EU_868 / LongFast / default key to close the
 
 **Verified on hardware:** self-test PASSED 10/10 (adds `tx loopback`, `duty-cycle`, `nodeinfo name`).
 
+## Phase 9 (polish / cross-board / docs) — DONE
+- Cross-board compile check: `lilygo-t-deck` (sibling T-Deck, shares LoRa + the board-ini) SUCCESS
+  (Flash 79.6%); `m5stack-cardputer` (different family, no LoRa pins, not LITE) SUCCESS (Flash 78.0%).
+  No regression; the module is portable (runtime pin checks, no board-specific hardcoding).
+- `lilygo-t-deck-pro` final = Phase 8 build (Flash 79.6% / RAM 39.0%); Phase 9 added docs only, no
+  firmware code change, so no reflash needed.
+- `docs/meshtastic-README.md` written (feature README deliverable).
+- No new format/compile warnings in the Meshtastic sources.
+
 ## Open decisions / to relay to user
 - Base branch (main vs lora-recon) — §5.1.
 - **Antenna safety:** EU868 antenna MUST be attached before radio power; TX into a missing/mismatched
