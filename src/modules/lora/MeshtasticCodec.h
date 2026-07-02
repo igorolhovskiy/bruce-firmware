@@ -112,6 +112,12 @@ struct DataMsg {
 // Returns false on any truncation / bad wire type (out.valid also cleared).
 bool decodeData(const uint8_t *buf, size_t len, DataMsg &out);
 
+// Extract long_name (field 2) and short_name (field 3) from a NODEINFO_APP
+// `User` protobuf payload (read-only). Both outputs are NUL-terminated (empty
+// if absent). Returns true if at least one name was found; false on truncation.
+bool decodeUserName(const uint8_t *buf, size_t len, char *longName, size_t longCap, char *shortName,
+                    size_t shortCap);
+
 // Deterministic Appendix-A self-test (no radio). Logs each sub-result to serial.
 bool runMeshtasticSelfTest();
 

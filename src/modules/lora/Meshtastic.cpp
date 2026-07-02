@@ -4,6 +4,7 @@
 #include "core/configPins.h"
 #include "core/display.h"
 #include "core/mykeyboard.h"
+#include "core/sd_functions.h"
 #include "modules/lora/LoRaRF.h"
 #include <Arduino.h>
 #include <RadioLib.h>
@@ -93,11 +94,42 @@ struct NodeEnt {
     float rssi;
     float snr;
     uint32_t count;
+    String name; // short name from NODEINFO, if heard (Phase 8)
 };
 std::vector<NodeEnt> nodes;
 constexpr size_t MAX_NODES = 48;
 int nodesCursor = 0;
 int nodesTop = 0;
+
+// SD conversation logging (Phase 8). CSV, appended per message; best-effort.
+bool meshSdLog = false;
+constexpr const char *MESH_LOG_PATH = "/meshtastic_log.csv";
+
+// Returns the known short name for a node, or "" if none heard yet.
+String nodeName(uint32_t id) {
+    for (auto &n : nodes)
+        if (n.id == id) return n.name;
+    return "";
+}
+
+// Append one message to the SD CSV log (best-effort; silently skips if no SD).
+void logMeshMsg(const char *dir, uint32_t nodeId, const String &name, float rssi, float snr, const String &text) {
+    if (!meshSdLog) return;
+    File f = SD.open(MESH_LOG_PATH, FILE_APPEND);
+    if (!f) return;
+    String safe = text;
+    safe.replace("\"", "'"); // keep the quoted CSV field intact
+    char head[80];
+    snprintf(head, sizeof(head), "%lu,%s,!%08x,", (unsigned long)millis(), dir, (unsigned)nodeId);
+    f.print(head);
+    f.print(name);
+    char rf[24];
+    snprintf(rf, sizeof(rf), ",%.0f,%.1f,\"", rssi, snr);
+    f.print(rf);
+    f.print(safe);
+    f.println("\"");
+    f.close();
+}
 
 // Render caches for flicker-free diffed drawing: a row/line is only repainted
 // when its text or colours actually change (mirrors the recon fix). Reset by
@@ -132,7 +164,16 @@ void touchNode(uint32_t id, float rssi, float snr) {
         }
     }
     if (nodes.size() >= MAX_NODES) nodes.erase(nodes.begin()); // evict oldest-inserted
-    nodes.push_back({id, millis(), rssi, snr, 1});
+    nodes.push_back({id, millis(), rssi, snr, 1, ""});
+}
+
+// Records/updates a heard node's short name from a NODEINFO User payload.
+void setNodeName(uint32_t id, const String &name) {
+    for (auto &n : nodes)
+        if (n.id == id) {
+            n.name = name;
+            return;
+        }
 }
 
 void addConvMsg(uint32_t from, bool mine, const String &text, float rssi, float snr) {
@@ -302,10 +343,22 @@ void decodeMeshFrame(const uint8_t *buf, size_t len, float rssi, float snr) {
         meshTextCount++;
         addConvMsg(hdr.from, false, text, rssi, snr);
         if (view == View::Conversation) needsRedraw = true;
+        logMeshMsg("rx", hdr.from, nodeName(hdr.from), rssi, snr, text);
         Serial.printf(
             "[Meshtastic]   >>> TEXT from !%08x: \"%s\" (rssi=%.0fdBm snr=%.1fdB)\n", (unsigned)hdr.from,
             text.c_str(), rssi, snr
         );
+    } else if (dm.portnum == meshtastic::NODEINFO_APP) {
+        // Read-only: pull the node's short/long name to label the nodes list.
+        char ln[32] = {0}, sn[12] = {0};
+        if (meshtastic::decodeUserName(dm.payload, dm.payloadLen, ln, sizeof(ln), sn, sizeof(sn))) {
+            String nm = strlen(sn) ? String(sn) : String(ln);
+            setNodeName(hdr.from, nm);
+            if (view == View::Nodes) needsRedraw = true;
+            Serial.printf(
+                "[Meshtastic]   node !%08x name: short=\"%s\" long=\"%s\"\n", (unsigned)hdr.from, sn, ln
+            );
+        }
     }
 }
 
@@ -389,6 +442,7 @@ bool sendMeshText(const String &text) {
     // Show our own sent line in the conversation view.
     addConvMsg(ourNodeId, true, text, 0, 0);
     needsRedraw = true;
+    logMeshMsg("tx", ourNodeId, "", 0, 0, text);
     Serial.printf(
         "[Meshtastic] TX #%lu id=0x%08x len=%u airtime=%ums used=%ums/%ums \"%s\"\n",
         (unsigned long)meshTxCount, (unsigned)id, (unsigned)frameLen, (unsigned)airMs,
@@ -537,14 +591,12 @@ void drawConversation() {
             if (m.mine) {
                 drawBodyRow(slot, y, shortText(">> " + m.text, 50), bruceConfig.priColor, TFT_BLACK);
             } else {
-                snprintf(meta, sizeof(meta), "!%08x: ", (unsigned)m.from);
-                String tag = " ";
-                {
-                    char rf[24];
-                    snprintf(rf, sizeof(rf), "  %.0f/%.0f", m.rssi, m.snr);
-                    tag = rf;
-                }
-                drawBodyRow(slot, y, shortText(String(meta) + m.text, 40) + tag, TFT_WHITE, TFT_BLACK);
+                String who = nodeName(m.from);
+                if (who.length()) snprintf(meta, sizeof(meta), "%s: ", who.c_str());
+                else snprintf(meta, sizeof(meta), "!%08x: ", (unsigned)m.from);
+                char rf[24];
+                snprintf(rf, sizeof(rf), "  %.0f/%.0f", m.rssi, m.snr);
+                drawBodyRow(slot, y, shortText(String(meta) + m.text, 40) + rf, TFT_WHITE, TFT_BLACK);
             }
         } else if (total == 0 && slot == 0) {
             drawBodyRow(slot, y, "  (no messages yet - SEL to compose)", TFT_DARKGREY, TFT_BLACK);
@@ -582,9 +634,11 @@ void drawNodes() {
             const NodeEnt &n = nodes[i];
             bool sel = (i == nodesCursor);
             uint32_t ageS = (millis() - n.lastSeenMs) / 1000;
+            char nameSeg[16] = {0};
+            if (n.name.length()) snprintf(nameSeg, sizeof(nameSeg), " %s", n.name.c_str());
             snprintf(
-                line, sizeof(line), "!%08x  %.0f/%.0f  x%lu  %lus", (unsigned)n.id, n.rssi, n.snr,
-                (unsigned long)n.count, (unsigned long)ageS
+                line, sizeof(line), "!%08x%s  %.0f/%.0f  x%lu  %lus", (unsigned)n.id, nameSeg, n.rssi,
+                n.snr, (unsigned long)n.count, (unsigned long)ageS
             );
             drawBodyRow(slot, y, line, sel ? TFT_BLACK : TFT_WHITE, sel ? bruceConfig.priColor : TFT_BLACK);
         } else if (nodes.empty() && slot == 0) {
@@ -680,6 +734,20 @@ void meshtasticChannel() {
     meshtastic::expandPsk(1, meshKey, meshKeyLen);
     ourNodeId = deriveNodeId();
     Serial.printf("[Meshtastic] our node-ID: !%08x\n", (unsigned)ourNodeId);
+
+    // SD conversation logging (best-effort). Write a CSV header on first create.
+    meshSdLog = false;
+    if (sdcardMounted || setupSdCard()) {
+        bool existed = SD.exists(MESH_LOG_PATH);
+        File f = SD.open(MESH_LOG_PATH, FILE_APPEND);
+        if (f) {
+            if (!existed) f.println("uptime_ms,dir,nodeid,name,rssi,snr,text");
+            f.close();
+            meshSdLog = true;
+            Serial.printf("[Meshtastic] SD log: %s\n", MESH_LOG_PATH);
+        }
+    }
+    if (!meshSdLog) Serial.println("[Meshtastic] SD log disabled (no card)");
 
     // Deterministic codec/crypto self-test (Appendix A) on every open, so a
     // regression is always visible before any radio traffic (mirrors recon).

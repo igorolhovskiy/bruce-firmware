@@ -180,6 +180,56 @@ bool decodeData(const uint8_t *buf, size_t len, DataMsg &out) {
     return true;
 }
 
+bool decodeUserName(const uint8_t *buf, size_t len, char *longName, size_t longCap, char *shortName,
+                    size_t shortCap) {
+    if (longCap) longName[0] = 0;
+    if (shortCap) shortName[0] = 0;
+    bool found = false;
+    size_t pos = 0;
+    while (pos < len) {
+        uint32_t tag;
+        if (!readVarint(buf, len, &pos, &tag)) return false;
+        uint32_t field = tag >> 3;
+        uint32_t wire = tag & 0x07;
+        switch (wire) {
+        case 0: {
+            uint32_t v;
+            if (!readVarint(buf, len, &pos, &v)) return false;
+            break;
+        }
+        case 2: {
+            uint32_t l;
+            if (!readVarint(buf, len, &pos, &l)) return false;
+            if (pos + l > len) return false;
+            if (field == 2 && longCap) { // long_name
+                size_t n = l < longCap - 1 ? l : longCap - 1;
+                memcpy(longName, buf + pos, n);
+                longName[n] = 0;
+                found = true;
+            } else if (field == 3 && shortCap) { // short_name
+                size_t n = l < shortCap - 1 ? l : shortCap - 1;
+                memcpy(shortName, buf + pos, n);
+                shortName[n] = 0;
+                found = true;
+            }
+            pos += l;
+            break;
+        }
+        case 5:
+            if (pos + 4 > len) return false;
+            pos += 4;
+            break;
+        case 1:
+            if (pos + 8 > len) return false;
+            pos += 8;
+            break;
+        default:
+            return false;
+        }
+    }
+    return found;
+}
+
 uint32_t DutyCycle::usedMs(uint32_t now) const {
     uint32_t sum = 0;
     for (size_t i = 0; i < count; i++) {
@@ -386,6 +436,22 @@ bool runMeshtasticSelfTest() {
         ok = ok && decodeData(pt, ctl, dm) && dm.portnum == TEXT_MESSAGE_APP && dm.payloadLen == mlen &&
              bytesEq(dm.payload, (const uint8_t *)msg, mlen);
         logCase("tx loopback", ok);
+        allOk &= ok;
+    }
+
+    // NODEINFO User name decode (long_name field 2, short_name field 3)
+    {
+        // User{ id="!12345678", long_name="Test Node", short_name="TN" }
+        const uint8_t user[] = {0x0a, 0x09, '!', '1', '2', '3', '4', '5', '6', '7', '8', 0x12, 0x09,
+                                'T',  'e',  's', 't', ' ', 'N', 'o', 'd', 'e', 0x1a, 0x02, 'T', 'N'};
+        char ln[40], sn[8];
+        bool ok = decodeUserName(user, sizeof(user), ln, sizeof(ln), sn, sizeof(sn)) &&
+                  strcmp(ln, "Test Node") == 0 && strcmp(sn, "TN") == 0;
+        // truncated User payload rejected without over-read
+        const uint8_t bad[] = {0x12, 0x09, 'T', 'e', 's', 't'};
+        char ln2[40], sn2[8];
+        ok = ok && !decodeUserName(bad, sizeof(bad), ln2, sizeof(ln2), sn2, sizeof(sn2));
+        logCase("nodeinfo name", ok);
         allOk &= ok;
     }
 

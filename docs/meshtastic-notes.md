@@ -253,6 +253,26 @@ state) + footer hints:
 actually change; no periodic `fillScreen`/region-fill. **User confirmed smooth, UI + navigation good.**
 Verified by driving two serial sends live (TX #1/#2) that appeared as `>>` lines while the user watched.
 
+## Phase 7 (live interop) — GAP (no peer this session)
+No Meshtastic peer was available, so full bidirectional interop is **not verified** (a gap, not a
+pass). Strong evidence exists both ways though: **RX** — real ambient LongFast frames (NODEINFO,
+POSITION) decode correctly off the air; **TX** — the exact frame we transmit, reconstructed offline
+with openssl, decodes via the stock-node path to our text, so a stock default-key node will display
+it. Revisit with a real node/app on EU_868 / LongFast / default key to close the gap.
+
+## Phase 8 (optional extras) — DONE (user picked: node names + SD logging)
+- **Node names (read-only):** `decodeUserName()` in the codec pulls long_name(f2)/short_name(f3) from
+  NODEINFO_APP `User` payloads; names shown in the nodes list and as the conversation sender label.
+  Self-test `nodeinfo name` case added. **Verified live:** decoded `!1c1612af` = short "AROZ" /
+  long "IAPC REV Router" from ambient traffic.
+- **SD conversation logging:** best-effort CSV at `/meshtastic_log.csv`
+  (`uptime_ms,dir,nodeid,name,rssi,snr,"text"`), appended per RX text and per TX; header written on
+  create; silently disabled when no card. All SD access is from the main loop (never the RX ISR), so
+  it doesn't race the radio on the shared SPI bus. **Verified:** `SD log: /meshtastic_log.csv` on open.
+- Not chosen: selectable modem preset. (Preset is fixed LongFast.)
+
+**Verified on hardware:** self-test PASSED 10/10 (adds `tx loopback`, `duty-cycle`, `nodeinfo name`).
+
 ## Open decisions / to relay to user
 - Base branch (main vs lora-recon) — §5.1.
 - **Antenna safety:** EU868 antenna MUST be attached before radio power; TX into a missing/mismatched
