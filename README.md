@@ -151,6 +151,15 @@ Also, [read our FAQ](https://wiki.bruce.computer/faq/)
 </details>
 
 <details>
+  <summary><h2>LoRa</h2></summary>
+
+- [x] Chat (Bruce-to-Bruce)
+- [x] [LoRa Recon](./docs/lora-recon-README.md) - passive, receive-only LoRa/LoRaWAN
+  reconnaissance (EU868): channel/SF sweep, human-readable frame decode, replay/FCnt anomaly
+  hints. T-Deck Plus only for now.
+</details>
+
+<details>
   <summary><h2>Scripts</h2></summary>
 
 - [x] [JavaScript Interpreter](https://wiki.bruce.computer/features/js-interpreter/) [Credits to justinknight93](https://github.com/justinknight93/Doolittle)
