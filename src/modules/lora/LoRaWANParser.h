@@ -86,6 +86,12 @@ LoRaWANFrame parseLoRaWANFrame(const uint8_t *data, size_t len);
 // "" when no hint applies. Illustrative only - never asserted in tests.
 String loRaWANOperatorHint(uint32_t devAddr);
 
+// Best-effort DevEUI OUI (IEEE-assigned top 3 bytes) hint. Deliberately
+// sparse: only entries backed by a verified source are included (no guessed
+// vendor names), so it stays honest rather than confidently wrong. Returns
+// "" when no hint applies.
+String loRaWANDevEuiOuiHint(const uint8_t devEUI[8]);
+
 // Builds the human-readable detail lines for a parsed frame (protocol
 // fields only; RF metrics like RSSI/link-margin are added by the caller).
 std::vector<String> describeLoRaWANFrame(const LoRaWANFrame &frame);

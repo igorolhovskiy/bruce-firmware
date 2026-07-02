@@ -97,12 +97,41 @@ SweepStage sweepStage = SweepStage::Channel;
 size_t sweepChannelIdx = 0;
 size_t sweepSfIdx = 0;
 uint32_t stageStartMs = 0;
-enum class LockMode { None, Sf, Rx2 };
+// Sf = brief's "recommended" variant (fix SF, hop channels). Exact = the
+// brief's alternative (fix both channel+SF, no hopping at all). Rx2 = park
+// on RX2 indefinitely.
+enum class LockMode { None, Sf, Rx2, Exact };
 LockMode lockMode = LockMode::None;
-size_t lockedSfIdx = 0; // meaningful only while lockMode == Sf
+size_t lockedSfIdx = 0;      // meaningful while lockMode == Sf or Exact
+size_t lockedChannelIdx = 0; // meaningful only while lockMode == Exact
 ComboStats comboStats[EU868_CHANNEL_COUNT][SF_DWELL_COUNT];
 uint32_t rx2PacketCount = 0;
 std::vector<CapturedFrame> capturedFrames; // newest at back()
+
+// Anomaly tracking: replayed DevNonce (per DevEUI) and FCnt regression (per
+// DevAddr). In-session only, fixed-size ring-evicted tables (no heap growth
+// over a long-running scan). Populated by processReconPacket() after each
+// parseLoRaWANFrame() call - a single frame carries no history of its own.
+constexpr size_t MAX_TRACKED_DEVADDRS = 32;
+struct DevAddrTrack {
+    uint32_t devAddr = 0;
+    uint16_t lastFcnt = 0;
+    bool valid = false;
+};
+DevAddrTrack devAddrTracker[MAX_TRACKED_DEVADDRS];
+size_t devAddrTrackNext = 0; // ring cursor once the table is full
+
+constexpr size_t MAX_TRACKED_DEVEUIS = 16;
+constexpr size_t MAX_NONCES_PER_DEVEUI = 8;
+struct DevEuiTrack {
+    uint8_t devEUI[8] = {0};
+    uint16_t nonces[MAX_NONCES_PER_DEVEUI] = {0};
+    size_t nonceCount = 0;
+    size_t nonceNext = 0; // ring cursor once nonces[] is full
+    bool valid = false;
+};
+DevEuiTrack devEuiTracker[MAX_TRACKED_DEVEUIS];
+size_t devEuiTrackNext = 0;
 
 enum class ViewMode { Sweep, FrameList, FrameDetail };
 ViewMode viewMode = ViewMode::Sweep;
@@ -173,7 +202,7 @@ void enterChannel(size_t chIdx, size_t sfIdx) {
     Serial.printf(
         "[LoRaRecon] sweep -> channel %u/%u %.3fMHz SF%u%s\n", (unsigned)(chIdx + 1),
         (unsigned)EU868_CHANNEL_COUNT, EU868_CHANNELS_MHZ[chIdx], SF_DWELL_TABLE[sfIdx].sf,
-        lockMode == LockMode::Sf ? " [LOCKED]" : ""
+        (lockMode == LockMode::Sf || lockMode == LockMode::Exact) ? " [LOCKED]" : ""
     );
 }
 
@@ -221,7 +250,7 @@ void advanceSweep() {
 }
 
 void updateSweep() {
-    if (lockMode == LockMode::Rx2) return; // parked indefinitely until unlocked - no time-based advance
+    if (lockMode == LockMode::Rx2 || lockMode == LockMode::Exact) return; // parked indefinitely until unlocked
     if (millis() - stageStartMs >= currentDwellMs()) advanceSweep();
 }
 
@@ -252,6 +281,25 @@ void toggleRx2Lock() {
     Serial.println("[LoRaRecon] RX2 lock enabled: parked indefinitely on RX2 (869.525MHz SF12, inverted IQ)");
 }
 
+// Toggles the brief's alternative lock variant: fixes both channel AND SF,
+// parked indefinitely on that one exact combo (no hopping at all), as
+// opposed to toggleLockAt()'s "fix SF, still hop channels" recommended mode.
+void toggleExactLock(size_t chIdx, size_t sfIdx) {
+    if (lockMode == LockMode::Exact && lockedChannelIdx == chIdx && lockedSfIdx == sfIdx) {
+        lockMode = LockMode::None;
+        Serial.println("[LoRaRecon] EXACT LOCK disabled: resuming full channel x SF sweep");
+        return;
+    }
+    lockMode = LockMode::Exact;
+    lockedChannelIdx = chIdx;
+    lockedSfIdx = sfIdx;
+    enterChannel(chIdx, sfIdx);
+    Serial.printf(
+        "[LoRaRecon] EXACT LOCK enabled: parked on channel %u/%u SF%u (no hopping)\n", (unsigned)(chIdx + 1),
+        (unsigned)EU868_CHANNEL_COUNT, SF_DWELL_TABLE[sfIdx].sf
+    );
+}
+
 void resetStats() {
     for (size_t c = 0; c < EU868_CHANNEL_COUNT; c++) {
         for (size_t s = 0; s < SF_DWELL_COUNT; s++) comboStats[c][s] = ComboStats();
@@ -259,6 +307,10 @@ void resetStats() {
     rx2PacketCount = 0;
     reconPacketCount = 0;
     capturedFrames.clear();
+    for (auto &t : devAddrTracker) t = DevAddrTrack();
+    for (auto &t : devEuiTracker) t = DevEuiTrack();
+    devAddrTrackNext = 0;
+    devEuiTrackNext = 0;
     Serial.println("[LoRaRecon] stats reset");
 }
 
@@ -316,6 +368,51 @@ void stopReconRadio() {
     clearReconRadio();
 }
 
+// Anomaly-tracking helper functions (state declared earlier, near comboStats).
+bool devEuiEqual(const uint8_t a[8], const uint8_t b[8]) { return memcmp(a, b, 8) == 0; }
+
+// Returns true if `fcnt` is lower than the last FCnt seen for this DevAddr
+// (a regression - could mean a rejoin, a reset device, or a replay attempt).
+bool trackFcntRegression(uint32_t devAddr, uint16_t fcnt) {
+    for (size_t i = 0; i < MAX_TRACKED_DEVADDRS; i++) {
+        if (devAddrTracker[i].valid && devAddrTracker[i].devAddr == devAddr) {
+            bool regressed = fcnt < devAddrTracker[i].lastFcnt;
+            devAddrTracker[i].lastFcnt = fcnt;
+            return regressed;
+        }
+    }
+    devAddrTracker[devAddrTrackNext] = {devAddr, fcnt, true};
+    devAddrTrackNext = (devAddrTrackNext + 1) % MAX_TRACKED_DEVADDRS;
+    return false;
+}
+
+// Returns true if this exact DevNonce was already seen from this DevEUI (a
+// replayed join request).
+bool trackDevNonceReplay(const uint8_t devEUI[8], uint16_t devNonce) {
+    for (size_t i = 0; i < MAX_TRACKED_DEVEUIS; i++) {
+        if (!devEuiTracker[i].valid || !devEuiEqual(devEuiTracker[i].devEUI, devEUI)) continue;
+        DevEuiTrack &t = devEuiTracker[i];
+        for (size_t n = 0; n < t.nonceCount; n++) {
+            if (t.nonces[n] == devNonce) return true;
+        }
+        if (t.nonceCount < MAX_NONCES_PER_DEVEUI) {
+            t.nonces[t.nonceCount++] = devNonce;
+        } else {
+            t.nonces[t.nonceNext] = devNonce;
+            t.nonceNext = (t.nonceNext + 1) % MAX_NONCES_PER_DEVEUI;
+        }
+        return false;
+    }
+    DevEuiTrack &t = devEuiTracker[devEuiTrackNext];
+    memcpy(t.devEUI, devEUI, 8);
+    t.nonces[0] = devNonce;
+    t.nonceCount = 1;
+    t.nonceNext = 0;
+    t.valid = true;
+    devEuiTrackNext = (devEuiTrackNext + 1) % MAX_TRACKED_DEVEUIS;
+    return false;
+}
+
 void processReconPacket() {
     if (!reconPacketReceived || !reconRadio) return;
     reconIrqEnabled = false;
@@ -348,6 +445,11 @@ void processReconPacket() {
         );
 
         LoRaWANFrame decoded = parseLoRaWANFrame(buf, len);
+        if (decoded.isDataFrame) {
+            decoded.anomalyFcntRegression = trackFcntRegression(decoded.devAddr, decoded.fcnt);
+        } else if (decoded.isJoinRequest) {
+            decoded.anomalyReplayedDevNonce = trackDevNonceReplay(decoded.devEUI, decoded.devNonce);
+        }
         Serial.printf("[LoRaRecon] decoded: %s\n", decoded.mtypeName.c_str());
         for (const String &line : describeLoRaWANFrame(decoded)) {
             Serial.print("  - ");
@@ -438,6 +540,13 @@ void handleSweepInput() {
         } else if (c == 'r' || c == 'R') {
             resetStats();
             needsRedraw = true;
+        } else if (c == 'x' || c == 'X') {
+            if (sweepCursor != (int)SWEEP_TABLE_ROWS - 1) { // RX2 row has its own dedicated lock via Select
+                size_t sfIdx = sweepCursor % SF_DWELL_COUNT;
+                size_t chIdx = sweepCursor / SF_DWELL_COUNT;
+                toggleExactLock(chIdx, sfIdx);
+                needsRedraw = true;
+            }
         }
     }
 }
@@ -468,7 +577,7 @@ void drawSweepScreen() {
         tft.setTextSize(FP);
         tft.setTextColor(TFT_WHITE, TFT_BLACK);
         tft.drawFastHLine(0, tftHeight - 13, tftWidth, TFT_DARKGREY);
-        tft.drawString("Up/Dn nav Sel=lock f=frames r=reset Bksp=exit", 2, tftHeight - 11, 1);
+        tft.drawString("Up/Dn nav Sel/x=lock f=frames r=reset Bksp=exit", 2, tftHeight - 11, 1);
         for (auto &c : sweepRowCache) c = "\x01"; // force every row slot to redraw this pass
         sweepLockLineCache = "\x01"; // force lock-status line to redraw this pass
     }
@@ -482,6 +591,9 @@ void drawSweepScreen() {
     String lockLine;
     if (lockMode == LockMode::Sf) {
         lockLine = "LOCK: SF" + String(SF_DWELL_TABLE[lockedSfIdx].sf) + " (hopping channels only)";
+    } else if (lockMode == LockMode::Exact) {
+        lockLine = "LOCK: CH" + String((unsigned)(lockedChannelIdx + 1)) + "/" + String((unsigned)EU868_CHANNEL_COUNT) +
+                   " SF" + String(SF_DWELL_TABLE[lockedSfIdx].sf) + " (exact, no hopping)";
     } else if (lockMode == LockMode::Rx2) {
         lockLine = "LOCK: RX2 (parked - not sweeping)";
     } else {
@@ -524,6 +636,8 @@ void drawSweepScreen() {
             isActive = (sweepStage == SweepStage::Channel && chIdx == sweepChannelIdx &&
                         sfIdx == (lockMode == LockMode::Sf ? lockedSfIdx : sweepSfIdx));
             bool isLockedSf = lockMode == LockMode::Sf && sfIdx == lockedSfIdx;
+            bool isExactLocked = lockMode == LockMode::Exact && chIdx == lockedChannelIdx && sfIdx == lockedSfIdx;
+            char marker = isExactLocked ? 'X' : (isLockedSf ? 'L' : ' ');
             char rssiBuf[6];
             if (cs.packetCount) snprintf(rssiBuf, sizeof(rssiBuf), "%-4.0f", cs.lastRssi);
             else snprintf(rssiBuf, sizeof(rssiBuf), "  --");
@@ -531,9 +645,8 @@ void drawSweepScreen() {
             if (cs.hasLastDevAddr) snprintf(addrBuf, sizeof(addrBuf), "%08lX", (unsigned long)cs.lastDevAddr);
             else snprintf(addrBuf, sizeof(addrBuf), "--------");
             snprintf(
-                line, sizeof(line), "%c%c%.3f SF%-2u n=%-4lu %s %s", isActive ? '>' : ' ',
-                isLockedSf ? 'L' : ' ', EU868_CHANNELS_MHZ[chIdx], SF_DWELL_TABLE[sfIdx].sf,
-                (unsigned long)cs.packetCount, rssiBuf, addrBuf
+                line, sizeof(line), "%c%c%.3f SF%-2u n=%-4lu %s %s", isActive ? '>' : ' ', marker,
+                EU868_CHANNELS_MHZ[chIdx], SF_DWELL_TABLE[sfIdx].sf, (unsigned long)cs.packetCount, rssiBuf, addrBuf
             );
         }
 
@@ -800,6 +913,7 @@ void loraRecon() {
 
     resetStats();
     lockMode = LockMode::None;
+    lockedChannelIdx = 0;
     viewMode = ViewMode::Sweep;
     sweepCursor = 0;
     sweepScrollTop = 0;

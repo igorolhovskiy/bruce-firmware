@@ -278,6 +278,16 @@ String loRaWANOperatorHint(uint32_t devAddr) {
     return "";
 }
 
+String loRaWANDevEuiOuiHint(const uint8_t devEUI[8]) {
+    // Deliberately sparse - only IEEE/Semtech-documented ranges are listed
+    // here, not guessed vendor OUIs, so a wrong attribution is never shown
+    // as if it were fact. Extend with verified IEEE OUI assignments only.
+    if (devEUI[0] == 0xFE && devEUI[1] == 0xFF && (devEUI[2] == 0xFF || devEUI[2] == 0xFE)) {
+        return "reserved test/development DevEUI range (no real OUI assigned)";
+    }
+    return "";
+}
+
 std::vector<String> describeLoRaWANFrame(const LoRaWANFrame &frame) {
     std::vector<String> lines;
 
@@ -294,10 +304,12 @@ std::vector<String> describeLoRaWANFrame(const LoRaWANFrame &frame) {
     }
 
     if (frame.isJoinRequest) {
-        char buf[64];
+        char buf[96];
+        String ouiHint = loRaWANDevEuiOuiHint(frame.devEUI);
         snprintf(
-            buf, sizeof(buf), "DevEUI %s - the device's globally-unique hardware ID (OUI %02X:%02X:%02X).",
-            hexBytes(frame.devEUI, 8).c_str(), frame.devEUI[0], frame.devEUI[1], frame.devEUI[2]
+            buf, sizeof(buf), "DevEUI %s - the device's globally-unique hardware ID (OUI %02X:%02X:%02X%s%s).",
+            hexBytes(frame.devEUI, 8).c_str(), frame.devEUI[0], frame.devEUI[1], frame.devEUI[2],
+            ouiHint.length() ? ", " : "", ouiHint.c_str()
         );
         if (frame.devEUI[0] || frame.devEUI[1] || frame.devEUI[2] || frame.devEUI[3] || frame.devEUI[4] ||
             frame.devEUI[5] || frame.devEUI[6] || frame.devEUI[7])
