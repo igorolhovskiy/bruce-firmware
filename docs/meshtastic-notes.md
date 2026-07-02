@@ -159,6 +159,37 @@ Firmware self-test must: reproduce both ciphertexts from plaintext, and decrypt 
 `to=0xFFFFFFFF, from=0x12345678, id=0x0000ABCD, hop_limit=3, channel=0x08, next_hop=0, relay_node=0`
 → 16 LE bytes `ff ff ff ff 78 56 34 12 cd ab 00 00 03 08 00 00` → round-trips. 10-byte buffer rejected.
 
+## Phase 1 (baseline) — DONE
+`pio run -e lilygo-t-deck-pro` on the `lora-recon` base: SUCCESS, Flash 79.2% / RAM 38.6%. Flashed;
+clean boot over serial (SDCard mounted, config JSON dumped), identical to the known-good recon build.
+
+## Phase 2 (menu stub) — DONE
+`"Meshtastic"` entry added to `LoRaMenu::optionsMenu()`; `src/modules/lora/Meshtastic.{h,cpp}` with a
+placeholder `meshtasticChannel()`. User confirmed on-device: entry appears, screen opens, Backspace exits.
+
+## Phase 3 (radio bring-up, RX) — DONE + real-frame validation
+Independent `SX1262` (own `Module`/instance, like recon) brought up in the LongFast config:
+869.525 MHz, SF11, BW250, CR4/5, sync `0x2b`, preamble 16, CRC on, standard IQ, PA capped +22 dBm
+(set now for Phase 5; RX-only this phase — no `transmit()` call). Interrupt-driven continuous RX
+(ISR flag + `readData` + `startReceive` re-arm), every frame logged `[Meshtastic] RX #N len rssi snr
+airtime crc hex`, 3 s heartbeat.
+
+**Verified on hardware — and better than the checkpoint required:** radio inits cleanly (heartbeats
+alive), *and a real Meshtastic frame was captured off the air* despite "no peer" — there is ambient
+LongFast traffic in range. The captured frame:
+```
+FFFFFFFF 9018AD08 F1A77E1A E5 08 00 00  <34B ciphertext>
+to=broadcast from=0x08AD1890 id=0x1A7EA7F1 flags=0xE5(hop_limit5,hop_start7) channel=0x08 nh=0 rn=0
+```
+**channel byte = 0x08 matches our computed LongFast hash against real traffic.** Decrypting the
+ciphertext offline (openssl, default key, nonce = id||from||0) yields a valid `Data` protobuf:
+`portnum=3 (POSITION_APP)`, 28-byte Position payload, `field9=1`. This pre-validates the *entire*
+Phase-4 decode chain (header layout, channel hash, nonce, PSK, AES-128-CTR, Data protobuf) against
+live over-the-air data.
+
+**Implication:** the RX/decrypt direction is testable against ambient traffic even without the user's
+own node. Only the TX→peer direction (Phase 7) still strictly needs the user's Meshtastic node/app.
+
 ## Open decisions / to relay to user
 - Base branch (main vs lora-recon) — §5.1.
 - **Antenna safety:** EU868 antenna MUST be attached before radio power; TX into a missing/mismatched
