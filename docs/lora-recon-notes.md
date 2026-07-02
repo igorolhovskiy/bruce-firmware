@@ -90,3 +90,39 @@ board config, not hardcoded in module code, per task guidance.
 ## Everything lines up with the task brief
 
 No design surprises requiring a decision yet. Proceeding to Phase 2 (menu entry stub).
+
+## Phase 2 (menu entry stub) — DONE
+
+Added `"Recon"` entry to `LoRaMenu::optionsMenu()`, new `src/modules/lora/LoRaRecon.{h,cpp}`
+with a placeholder `loraRecon()`. Verified on hardware: entry appears in LoRa submenu,
+placeholder screen renders, and **the T-Deck's "back" key is physical Backspace/Delete (⌫),
+not a labeled Esc** — Bruce maps `keyValue == 0x08` → `KeyStroke.del` → `EscPress`
+(`boards/lilygo-t-deck/interface.cpp`). Worth remembering for all future UI phases.
+
+## Phase 3 (promiscuous single-channel RX) — DONE
+
+- Added `-DLORA_BUSY=13` to `boards/lilygo-t-deck/lilygo-t-deck.ini` (`[env:lilygo-t-deck-pro]`)
+  — closes the pin gap noted above. Note: changing `build_flags` invalidates scons's whole
+  object cache, so this triggered a full rebuild (same duration as the original baseline).
+- Exposed `LoRaRF.cpp`'s pin/SPI-bus helpers (`getLoraIrqPin/BusyPin/ResetPin/CsPin`,
+  `selectLoraSPIBus`) via `LoRaRF.h` so `LoRaRecon.cpp` reuses the *exact* bring-up logic
+  (including the T-Deck's shared TFT/SD/CC1101 SPI bus handling) via its own independent
+  `SX1262`/`Module` instance — no shared mutable state with the chat module.
+  `LoRaRecon.cpp` never calls a transmit API (verified by grep as part of the commit).
+- Fixed test config: 868.1 MHz, SF7, BW125, CR4/5, preamble 8, LoRaWAN public sync `0x34`.
+  CRC is left at RadioLib's default (already ON from `begin()`); on `RADIOLIB_ERR_CRC_MISMATCH`
+  the buffer is still read and logged (RadioLib's `SX126x::readData` populates `data` before
+  checking CRC either way) — malformed frames are visible, not dropped.
+- Every frame logs to serial: `[LoRaRecon] RX #N len=.. rssi=..dBm snr=..dB airtime=..ms
+  crc=OK|MISMATCH hex=..`. A 3s heartbeat (`listening... packets=N uptime=Ns`) proves the
+  loop and radio are alive even with zero traffic.
+- **Verified on hardware:** clean boot, radio initializes without error (heartbeats prove
+  this — a failed init sits in an error loop with no heartbeat output), Backspace exits
+  cleanly. **Not yet verified:** real-frame capture — no transmitter (Meshtastic node,
+  LoRaWAN device, or beacon board) was available this session. 0 packets on the fixed
+  868.1MHz/SF7/sync-0x34 config is expected without a matching transmitter nearby (task
+  brief §10 calls this out explicitly as not-a-bug). **Follow-up:** when a transmitter is
+  available, retune (temporarily, for a manual test) to confirm the RX chain captures real
+  frames before trusting Phase 5's sweep engine end-to-end. The user has Meshtastic tooling
+  installed (`meshtastic`, `mesh-analysis`, `mesh-tunnel` in `.pyproject`) but no node was
+  on hand at test time — worth asking again later.
