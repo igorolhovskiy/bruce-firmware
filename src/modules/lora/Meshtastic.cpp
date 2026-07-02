@@ -1,5 +1,6 @@
 #if !defined(LITE_VERSION)
 #include "Meshtastic.h"
+#include "MeshtasticCodec.h"
 #include "core/configPins.h"
 #include "core/display.h"
 #include "core/mykeyboard.h"
@@ -48,6 +49,16 @@ size_t lastRxLen = 0;
 float lastRxRssi = 0;
 float lastRxSnr = 0;
 uint32_t lastRxAtMs = 0;
+
+// Decoded-traffic snapshot (Phase 4). Full conversation/nodes store is Phase 6.
+uint32_t meshTextCount = 0;
+String lastText;
+uint32_t lastTextFrom = 0;
+bool selfTestPassed = false;
+
+// LongFast default-channel key, expanded once at start.
+uint8_t meshKey[16];
+size_t meshKeyLen = 0;
 
 void IRAM_ATTR onMeshPacket() {
     if (!meshIrqEnabled) return;
@@ -138,8 +149,76 @@ void stopMeshRadio() {
     clearMeshRadio();
 }
 
-// Reads one pending frame, logs it raw with RF metrics, re-arms RX. Phase 4
-// will add header parse / channel-hash filter / decrypt / protobuf decode here.
+// Returns a human label for a portnum (text ones surfaced, others by number).
+String portName(uint32_t portnum) {
+    switch (portnum) {
+    case meshtastic::TEXT_MESSAGE_APP: return "TEXT";
+    case meshtastic::POSITION_APP: return "POSITION";
+    case meshtastic::NODEINFO_APP: return "NODEINFO";
+    case meshtastic::ROUTING_APP: return "ROUTING";
+    case meshtastic::UNKNOWN_APP: return "UNKNOWN";
+    default: return "port#" + String(portnum);
+    }
+}
+
+// Phase 4 decode path: header parse -> channel-hash filter -> AES-CTR decrypt
+// with the LongFast key -> minimal Data protobuf decode -> surface text.
+// `buf`/`len` is the full on-air frame (header + ciphertext).
+void decodeMeshFrame(const uint8_t *buf, size_t len, float rssi, float snr) {
+    meshtastic::PacketHeader hdr;
+    if (!meshtastic::unpackHeader(buf, len, hdr)) {
+        Serial.println("[Meshtastic]   frame too short for header, skipped");
+        return;
+    }
+    Serial.printf(
+        "[Meshtastic]   hdr to=!%08x from=!%08x id=0x%08x flags=0x%02x ch=0x%02x hop=%u/%u nh=%u rn=%u\n",
+        hdr.to, hdr.from, hdr.id, hdr.flags, hdr.channel, hdr.hopLimit(), hdr.hopStart(), hdr.next_hop,
+        hdr.relay_node
+    );
+
+    if (hdr.channel != meshtastic::LONGFAST_CHANNEL_HASH) {
+        Serial.printf(
+            "[Meshtastic]   channel 0x%02x != LongFast 0x%02x - not our channel, skipped\n", hdr.channel,
+            meshtastic::LONGFAST_CHANNEL_HASH
+        );
+        return;
+    }
+
+    size_t ctLen = len - meshtastic::HEADER_LEN;
+    if (ctLen == 0 || ctLen > meshtastic::MAX_PLAINTEXT) {
+        Serial.println("[Meshtastic]   empty/oversized ciphertext, skipped");
+        return;
+    }
+
+    uint8_t pt[meshtastic::MAX_PLAINTEXT];
+    memcpy(pt, buf + meshtastic::HEADER_LEN, ctLen);
+    uint8_t nonce[16];
+    meshtastic::initNonce(hdr.from, hdr.id, nonce);
+    meshtastic::aesCtrCrypt(meshKey, nonce, pt, ctLen);
+
+    meshtastic::DataMsg dm;
+    if (!meshtastic::decodeData(pt, ctLen, dm)) {
+        Serial.println("[Meshtastic]   decrypt->protobuf undecodable (foreign key or non-Data), ignored");
+        return;
+    }
+    Serial.printf("[Meshtastic]   decoded portnum=%u (%s) payloadLen=%u\n", dm.portnum,
+                  portName(dm.portnum).c_str(), (unsigned)dm.payloadLen);
+
+    if (dm.portnum == meshtastic::TEXT_MESSAGE_APP) {
+        String text;
+        text.reserve(dm.payloadLen + 1);
+        for (size_t i = 0; i < dm.payloadLen; i++) text += (char)dm.payload[i];
+        meshTextCount++;
+        lastText = text;
+        lastTextFrom = hdr.from;
+        Serial.printf(
+            "[Meshtastic]   >>> TEXT from !%08x: \"%s\" (rssi=%.0fdBm snr=%.1fdB)\n", hdr.from, text.c_str(),
+            rssi, snr
+        );
+    }
+}
+
+// Reads one pending frame, logs it raw with RF metrics, decodes it, re-arms RX.
 void processMeshRx() {
     if (!meshPacketReceived || !meshRadio) return;
     meshIrqEnabled = false;
@@ -171,6 +250,7 @@ void processMeshRx() {
             (unsigned long)meshRxCount, (unsigned)len, rssi, snr, airtimeMs, crcOk ? "OK" : "MISMATCH",
             toHex(buf, len).c_str()
         );
+        decodeMeshFrame(buf, len, rssi, snr);
     } else {
         Serial.printf("[Meshtastic] RX read failed: %d\n", state);
     }
@@ -207,7 +287,20 @@ void drawStatusScreen() {
         );
         tft.drawString(line, 6, y);
     }
+    y += 16;
+    snprintf(line, sizeof(line), "Text msgs: %lu", (unsigned long)meshTextCount);
+    tft.drawString(line, 6, y);
+    if (meshTextCount > 0) {
+        y += 12;
+        tft.setTextColor(bruceConfig.priColor, TFT_BLACK);
+        char t[64];
+        snprintf(t, sizeof(t), "!%08x: %s", lastTextFrom, lastText.c_str());
+        tft.drawString(String(t).substring(0, 40), 6, y);
+        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    }
 
+    tft.setTextColor(selfTestPassed ? TFT_GREEN : TFT_RED, TFT_BLACK);
+    tft.drawString(selfTestPassed ? "self-test: OK" : "self-test: FAIL", 6, tftHeight - 28);
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
     tft.drawCentreString("Backspace to exit", tftWidth / 2, tftHeight - 16, 1);
 }
@@ -218,14 +311,29 @@ void meshtasticChannel() {
     Serial.println("[Meshtastic] opening (LongFast / EU868)");
     meshRxCount = 0;
     lastRxLen = 0;
+    meshTextCount = 0;
+    lastText = "";
+    lastTextFrom = 0;
+
+    // Expand the LongFast default channel key (PSK index 1) once.
+    meshtastic::expandPsk(1, meshKey, meshKeyLen);
+
+    // Deterministic codec/crypto self-test (Appendix A) on every open, so a
+    // regression is always visible before any radio traffic (mirrors recon).
+    selfTestPassed = meshtastic::runMeshtasticSelfTest();
 
     tft.fillScreen(TFT_BLACK);
     tft.setTextSize(FM);
     tft.setTextColor(bruceConfig.priColor, TFT_BLACK);
     tft.drawCentreString("Meshtastic LF", tftWidth / 2, 8, 1);
     tft.setTextSize(FP);
+    tft.setTextColor(selfTestPassed ? TFT_GREEN : TFT_RED, TFT_BLACK);
+    tft.drawCentreString(
+        selfTestPassed ? "self-test: OK" : "self-test: FAILED", tftWidth / 2, tftHeight / 2 - 10, 1
+    );
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawCentreString("starting radio...", tftWidth / 2, tftHeight / 2, 1);
+    tft.drawCentreString("starting radio...", tftWidth / 2, tftHeight / 2 + 6, 1);
+    delay(500);
 
     if (!startMeshRadio()) {
         while (true) {

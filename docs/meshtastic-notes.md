@@ -190,6 +190,28 @@ live over-the-air data.
 **Implication:** the RX/decrypt direction is testable against ambient traffic even without the user's
 own node. Only the TX→peer direction (Phase 7) still strictly needs the user's Meshtastic node/app.
 
+## Phase 4 (framing + crypto + protobuf decode + self-test) — DONE
+New `src/modules/lora/MeshtasticCodec.{h,cpp}` (pure data-plane, no radio/display, unit-testable):
+header pack/unpack, PSK expansion, channel hash, AES-CTR nonce, AES-128-CTR (mbedtls
+`mbedtls_aes_crypt_ctr`), minimal `Data` protobuf encode/decode (varint + length-delimited, bounds-
+checked, skips unknown fields, never over-reads). RX path in `Meshtastic.cpp` now: unpack header →
+log → filter on channel==0x08 → decrypt with LongFast key → decode Data → surface TEXT by portnum.
+
+`runMeshtasticSelfTest()` runs on every module open (Appendix A):
+- protobuf(hi) encode==`08 01 12 02 68 69` + decode + empty-payload + trailing-unknown-field
+- psk-expand (index 1==defaultpsk, index 2 last byte 0x02, index 0 => len 0)
+- channel-hash("LongFast", defaultpsk)==0x08
+- aes-ctr KAT: nonce layout + single-block ct `4d7577d5e002` + multi-block ct
+  `4d7577c6c00e...652ac0` (both openssl-generated) + round-trips
+- header pack/unpack == `ff ff ff ff 78 56 34 12 cd ab 00 00 03 08 00 00` + 10-byte reject
+- negative/edge: truncated protobuf rejected, non-text portnum surfaced by number
+
+**Verified on hardware:** `self-test PASSED` (all 6). And a real ambient frame decoded live:
+`from=!04b026e8 ch=0x08 hop=2/7 -> portnum=4 (NODEINFO) payloadLen=83`. Full decrypt+decode chain
+confirmed end-to-end against over-the-air traffic. (No TEXT frame happened nearby during the window;
+text path is identical decode + the self-test covers text extraction.) mbedtls AES-CTR is confirmed
+byte-compatible with Meshtastic in practice (real frames decrypt to valid protobufs).
+
 ## Open decisions / to relay to user
 - Base branch (main vs lora-recon) — §5.1.
 - **Antenna safety:** EU868 antenna MUST be attached before radio power; TX into a missing/mismatched
