@@ -99,6 +99,27 @@ constexpr size_t MAX_NODES = 48;
 int nodesCursor = 0;
 int nodesTop = 0;
 
+// Render caches for flicker-free diffed drawing: a row/line is only repainted
+// when its text or colours actually change (mirrors the recon fix). Reset by
+// resetRenderCache() on every view entry (viewFullClear).
+constexpr int MAX_BODY_ROWS = 24;
+String bodyTextCache[MAX_BODY_ROWS];
+uint16_t bodyFgCache[MAX_BODY_ROWS];
+uint16_t bodyBgCache[MAX_BODY_ROWS];
+String chromeLineCache[2];
+String footerCache;
+
+void resetRenderCache() {
+    for (int i = 0; i < MAX_BODY_ROWS; i++) {
+        bodyTextCache[i] = "\x01"; // sentinel: guarantees first draw differs
+        bodyFgCache[i] = 0xDEAD;
+        bodyBgCache[i] = 0xDEAD;
+    }
+    chromeLineCache[0] = "\x01";
+    chromeLineCache[1] = "\x01";
+    footerCache = "\x01";
+}
+
 // Records/updates a heard node from any decoded frame's `from` field.
 void touchNode(uint32_t id, float rssi, float snr) {
     for (auto &n : nodes) {
@@ -432,29 +453,51 @@ String shortText(const String &s, size_t maxChars) {
     return s.substring(0, maxChars);
 }
 
-// Shared top chrome: title + node-ID, then preset/freq + duty budget + TX state.
+// Draw one body row only if its text/colours changed since last time (diffed to
+// avoid flicker). `slot` indexes the cache; row is cleared to bg then painted.
+void drawBodyRow(int slot, int y, const String &text, uint16_t fg, uint16_t bg) {
+    if (slot < 0 || slot >= MAX_BODY_ROWS) return;
+    if (bodyTextCache[slot] == text && bodyFgCache[slot] == fg && bodyBgCache[slot] == bg) return;
+    bodyTextCache[slot] = text;
+    bodyFgCache[slot] = fg;
+    bodyBgCache[slot] = bg;
+    tft.fillRect(0, y - 1, tftWidth, ROW_H, bg);
+    tft.setTextSize(FP);
+    tft.setTextColor(fg, bg);
+    tft.drawString(text, 4, y);
+}
+
+// Shared top chrome, diffed per line so the 1 Hz duty/age refresh doesn't flash.
 void drawChrome() {
-    tft.fillRect(0, 0, tftWidth, CHROME_H, TFT_BLACK);
     tft.setTextSize(FP);
     char line[80];
 
-    tft.setTextColor(bruceConfig.priColor, TFT_BLACK);
     snprintf(line, sizeof(line), "Meshtastic LF  !%08x", (unsigned)ourNodeId);
-    tft.drawString(line, 4, 2);
+    if (chromeLineCache[0] != line) {
+        chromeLineCache[0] = line;
+        tft.fillRect(0, 0, tftWidth, 11, TFT_BLACK);
+        tft.setTextColor(bruceConfig.priColor, TFT_BLACK);
+        tft.drawString(line, 4, 2);
+    }
 
     uint32_t used = dutyCycle.usedMs(millis());
     int pct = dutyCycle.budgetMs ? (int)((used * 100) / dutyCycle.budgetMs) : 0;
     const char *st = txInProgress ? "TX>>" : (lastTxBlocked ? "BLK" : "RX");
-    tft.setTextColor(
-        txInProgress ? TFT_ORANGE : (lastTxBlocked || pct >= 100 ? TFT_RED : TFT_GREEN), TFT_BLACK
-    );
     snprintf(line, sizeof(line), "LongFast 869.5  duty:%d%%  TX:%lu  %s", pct, (unsigned long)meshTxCount, st);
-    tft.drawString(line, 4, 14);
-
-    tft.drawFastHLine(0, CHROME_H - 2, tftWidth, TFT_DARKGREY);
+    if (chromeLineCache[1] != line) {
+        chromeLineCache[1] = line;
+        tft.fillRect(0, 13, tftWidth, 12, TFT_BLACK);
+        tft.setTextColor(
+            txInProgress ? TFT_ORANGE : (lastTxBlocked || pct >= 100 ? TFT_RED : TFT_GREEN), TFT_BLACK
+        );
+        tft.drawString(line, 4, 14);
+        tft.drawFastHLine(0, CHROME_H - 2, tftWidth, TFT_DARKGREY);
+    }
 }
 
-void drawFooter(const char *hint) {
+void drawFooter(const String &hint) {
+    if (footerCache == hint) return;
+    footerCache = hint;
     tft.fillRect(0, tftHeight - FOOTER_H, tftWidth, FOOTER_H, TFT_BLACK);
     tft.setTextSize(FP);
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
@@ -466,6 +509,7 @@ void drawFooter(const char *hint) {
 void drawConversation() {
     if (viewFullClear) {
         tft.fillScreen(TFT_BLACK);
+        resetRenderCache();
         viewFullClear = false;
     }
     drawChrome();
@@ -473,38 +517,40 @@ void drawConversation() {
     int bodyTop = CHROME_H;
     int bodyH = tftHeight - CHROME_H - FOOTER_H;
     int rows = bodyH / ROW_H;
-    tft.fillRect(0, bodyTop, tftWidth, bodyH, TFT_BLACK);
-    tft.setTextSize(FP);
+    if (rows > MAX_BODY_ROWS) rows = MAX_BODY_ROWS;
 
     int total = (int)convo.size();
-    // Bottom-anchored window; convScroll shifts it toward older messages.
-    int end = total - convScroll;      // one past last visible
+    int end = total - convScroll; // one past last visible (bottom-anchored)
     if (end > total) end = total;
     if (end < 0) end = 0;
     int start = end - rows;
     if (start < 0) start = 0;
 
-    int y = bodyTop + (bodyH - (end - start) * ROW_H); // bottom-align if few msgs
-    if (y < bodyTop) y = bodyTop;
-    char meta[48];
-    for (int i = start; i < end; i++) {
-        const ConvMsg &m = convo[i];
-        if (m.mine) {
-            tft.setTextColor(bruceConfig.priColor, TFT_BLACK);
-            tft.drawString(shortText(">> " + m.text, 50), 4, y);
+    char meta[64];
+    // Each of the `rows` fixed slots either shows a message or is blanked, so a
+    // scrolled-away line is cleared (not left stale) but only when it changed.
+    for (int slot = 0; slot < rows; slot++) {
+        int y = bodyTop + slot * ROW_H;
+        int i = start + slot;
+        if (i < end && i < total) {
+            const ConvMsg &m = convo[i];
+            if (m.mine) {
+                drawBodyRow(slot, y, shortText(">> " + m.text, 50), bruceConfig.priColor, TFT_BLACK);
+            } else {
+                snprintf(meta, sizeof(meta), "!%08x: ", (unsigned)m.from);
+                String tag = " ";
+                {
+                    char rf[24];
+                    snprintf(rf, sizeof(rf), "  %.0f/%.0f", m.rssi, m.snr);
+                    tag = rf;
+                }
+                drawBodyRow(slot, y, shortText(String(meta) + m.text, 40) + tag, TFT_WHITE, TFT_BLACK);
+            }
+        } else if (total == 0 && slot == 0) {
+            drawBodyRow(slot, y, "  (no messages yet - SEL to compose)", TFT_DARKGREY, TFT_BLACK);
         } else {
-            tft.setTextColor(TFT_WHITE, TFT_BLACK);
-            snprintf(meta, sizeof(meta), "!%08x", (unsigned)m.from);
-            tft.drawString(shortText(String(meta) + ": " + m.text, 44), 4, y);
-            tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-            snprintf(meta, sizeof(meta), "%.0f/%.0f", m.rssi, m.snr);
-            tft.drawString(meta, tftWidth - tft.textWidth(meta) - 4, y);
+            drawBodyRow(slot, y, "", TFT_WHITE, TFT_BLACK); // blank unused slot
         }
-        y += ROW_H;
-    }
-    if (convo.empty()) {
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        tft.drawCentreString("no messages yet", tftWidth / 2, bodyTop + bodyH / 2, 1);
     }
 
     drawFooter(convScroll > 0 ? "SEL compose  n nodes  ^v scroll(older)  <-exit"
@@ -515,6 +561,7 @@ void drawConversation() {
 void drawNodes() {
     if (viewFullClear) {
         tft.fillScreen(TFT_BLACK);
+        resetRenderCache();
         viewFullClear = false;
     }
     drawChrome();
@@ -522,33 +569,32 @@ void drawNodes() {
     int bodyTop = CHROME_H;
     int bodyH = tftHeight - CHROME_H - FOOTER_H;
     int rows = bodyH / ROW_H;
-    tft.fillRect(0, bodyTop, tftWidth, bodyH, TFT_BLACK);
-    tft.setTextSize(FP);
+    if (rows > MAX_BODY_ROWS) rows = MAX_BODY_ROWS;
 
     if (nodesCursor < nodesTop) nodesTop = nodesCursor;
     if (nodesCursor >= nodesTop + rows) nodesTop = nodesCursor - rows + 1;
 
     char line[80];
-    int shown = 0;
-    for (int i = nodesTop; i < (int)nodes.size() && shown < rows; i++, shown++) {
-        const NodeEnt &n = nodes[i];
-        int y = bodyTop + shown * ROW_H;
-        bool sel = (i == nodesCursor);
-        if (sel) tft.fillRect(0, y - 1, tftWidth, ROW_H, bruceConfig.priColor);
-        tft.setTextColor(sel ? TFT_BLACK : TFT_WHITE, sel ? bruceConfig.priColor : TFT_BLACK);
-        uint32_t ageS = (millis() - n.lastSeenMs) / 1000;
-        snprintf(
-            line, sizeof(line), "!%08x  %.0f/%.0f  x%lu  %lus", (unsigned)n.id, n.rssi, n.snr,
-            (unsigned long)n.count, (unsigned long)ageS
-        );
-        tft.drawString(line, 4, y);
-    }
-    if (nodes.empty()) {
-        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        tft.drawCentreString("no nodes heard yet", tftWidth / 2, bodyTop + bodyH / 2, 1);
+    for (int slot = 0; slot < rows; slot++) {
+        int y = bodyTop + slot * ROW_H;
+        int i = nodesTop + slot;
+        if (i < (int)nodes.size()) {
+            const NodeEnt &n = nodes[i];
+            bool sel = (i == nodesCursor);
+            uint32_t ageS = (millis() - n.lastSeenMs) / 1000;
+            snprintf(
+                line, sizeof(line), "!%08x  %.0f/%.0f  x%lu  %lus", (unsigned)n.id, n.rssi, n.snr,
+                (unsigned long)n.count, (unsigned long)ageS
+            );
+            drawBodyRow(slot, y, line, sel ? TFT_BLACK : TFT_WHITE, sel ? bruceConfig.priColor : TFT_BLACK);
+        } else if (nodes.empty() && slot == 0) {
+            drawBodyRow(slot, y, "  (no nodes heard yet)", TFT_DARKGREY, TFT_BLACK);
+        } else {
+            drawBodyRow(slot, y, "", TFT_WHITE, TFT_BLACK);
+        }
     }
 
-    char cnt[40];
+    char cnt[48];
     snprintf(cnt, sizeof(cnt), "%d nodes  ^v move  n/<- back", (int)nodes.size());
     drawFooter(cnt);
 }

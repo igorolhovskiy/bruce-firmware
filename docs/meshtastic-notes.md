@@ -237,6 +237,22 @@ node will display it. TX byte-correctness confirmed; only a live peer receiving 
 unverified (no peer this session). Duty-cycle *blocking* demonstrated deterministically by the
 self-test (same `wouldExceed`/`msUntilAvailable` code `sendMeshText` uses).
 
+## Phase 6 (on-screen UI) — DONE
+Three views on 320x240, shared chrome (node-ID, LongFast/869.5, duty-cycle %, TX count, RX/TX/BLK
+state) + footer hints:
+- **Screen A Conversation:** newest at bottom, own msgs `>>` in priColor, others `!from: text` + RF
+  tag; trackball up/down scrolls (bottom-anchored, pages toward older); SEL or `c` = compose.
+- **Screen B Compose:** modal `keyboard("Type message:")` → `sendMeshText()` (duty-guarded).
+- **Screen C Nodes:** `n` opens; node-ID / last RSSI-SNR / count / age, cursor-navigable; `n` or
+  Backspace returns. Populated from `from` of every decoded frame.
+- Backspace exits from Conversation.
+
+**Flicker fix (same bug recon hit):** first cut redrew whole regions every 1 s tick → user reported
+"flapping screen". Fixed with per-row/-line content diffing (`bodyTextCache`/`bodyFgCache`/`bodyBgCache`,
+`chromeLineCache`, `footerCache`, reset on view entry): a row is only repainted when its text/colours
+actually change; no periodic `fillScreen`/region-fill. **User confirmed smooth, UI + navigation good.**
+Verified by driving two serial sends live (TX #1/#2) that appeared as `>>` lines while the user watched.
+
 ## Open decisions / to relay to user
 - Base branch (main vs lora-recon) — §5.1.
 - **Antenna safety:** EU868 antenna MUST be attached before radio power; TX into a missing/mismatched
