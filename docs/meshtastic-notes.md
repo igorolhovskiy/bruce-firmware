@@ -212,6 +212,31 @@ confirmed end-to-end against over-the-air traffic. (No TEXT frame happened nearb
 text path is identical decode + the self-test covers text extraction.) mbedtls AES-CTR is confirmed
 byte-compatible with Meshtastic in practice (real frames decrypt to valid protobufs).
 
+## Phase 5 (encode + TX + duty-cycle guard + loopback) — DONE
+- **Node-ID:** derived from ESP32 efuse MAC low 4 bytes (`deriveNodeId()`), stable across boots
+  without extra storage; displayed `!%08x` (this device: `!d69fc114`). Avoids 0/broadcast.
+- **`sendMeshText()`** (the only TX path, user/serial-triggered, never in a loop): encode Data
+  (TEXT_MESSAGE_APP) → random non-zero packet `id` (`esp_random`) → AES-CTR encrypt with the
+  LongFast key + nonce(ourNode,id) → prepend header (to=broadcast, from=ourNode, id, flags
+  `makeFlags(3,false,3)`=0x63 hop_limit3/hop_start3, channel=0x08) → **duty-cycle guard** →
+  `transmit()` → re-arm RX.
+- **Duty-cycle guard (mandatory, in every TX path):** `meshtastic::DutyCycle` rolling-window airtime
+  tracker (1 h window, 10% = 360 s budget). `wouldExceed()` blocks before transmit; `msUntilAvailable()`
+  reports retry time; airtime from `radio->getTimeOnAir(frameLen)`. Surfaced in the UI as "duty: N%%
+  used" / "TX blocked (retry ~Ns)".
+- **PA power** capped at +22 dBm (SX1262 max; region limit 27 dBm).
+- **Serial-triggered TX:** a line typed on USB serial is sent as a text message (lets sending be
+  triggered/observed autonomously; on-screen compose keyboard is Phase 6).
+
+**Verified on hardware:** self-test PASSED all 8 (protobuf, psk-expand, channel-hash, aes-ctr KAT,
+header, negative/edge, **tx loopback**, **duty-cycle**). A real transmit succeeded:
+`TX #1 id=0x71f952ba len=46 airtime=600ms used=600ms/360000ms "Bruce T-Deck LongFast test"`.
+**Offline proof of interop:** reconstructing that exact frame (openssl, same key/nonce) and decoding
+it via the stock-node path yields `portnum=1, "Bruce T-Deck LongFast test"` — a stock default-key
+node will display it. TX byte-correctness confirmed; only a live peer receiving it (Phase 7) remains
+unverified (no peer this session). Duty-cycle *blocking* demonstrated deterministically by the
+self-test (same `wouldExceed`/`msUntilAvailable` code `sendMeshText` uses).
+
 ## Open decisions / to relay to user
 - Base branch (main vs lora-recon) — §5.1.
 - **Antenna safety:** EU868 antenna MUST be attached before radio power; TX into a missing/mismatched

@@ -180,6 +180,39 @@ bool decodeData(const uint8_t *buf, size_t len, DataMsg &out) {
     return true;
 }
 
+uint32_t DutyCycle::usedMs(uint32_t now) const {
+    uint32_t sum = 0;
+    for (size_t i = 0; i < count; i++) {
+        size_t idx = (head + CAP - count + i) % CAP;
+        if ((uint32_t)(now - atMs[idx]) < windowMs) sum += airMs[idx];
+    }
+    return sum;
+}
+
+void DutyCycle::record(uint32_t now, uint32_t air) {
+    atMs[head] = now;
+    airMs[head] = air;
+    head = (head + 1) % CAP;
+    if (count < CAP) count++;
+}
+
+uint32_t DutyCycle::msUntilAvailable(uint32_t now, uint32_t newAirMs) const {
+    uint32_t used = usedMs(now);
+    if (used + newAirMs <= budgetMs) return 0;
+    uint32_t needToShed = used + newAirMs - budgetMs;
+    // Walk records oldest-first; once we have shed enough, the time until that
+    // record leaves the window is how long the caller must wait.
+    uint32_t shed = 0;
+    for (size_t i = 0; i < count; i++) {
+        size_t idx = (head + CAP - count + i) % CAP;
+        uint32_t age = (uint32_t)(now - atMs[idx]);
+        if (age >= windowMs) continue; // already out of window
+        shed += airMs[idx];
+        if (shed >= needToShed) return windowMs - age; // this record expiring frees enough
+    }
+    return windowMs; // shouldn't happen if newAirMs <= budgetMs
+}
+
 // ---------------------------------------------------------------------------
 // Appendix A self-test. All vectors are either hand-verifiable (protobuf,
 // hash, nonce, header) or generated with reference tooling (the two AES-CTR
@@ -312,6 +345,67 @@ bool runMeshtasticSelfTest() {
         DataMsg dm2;
         ok = ok && decodeData(posMsg, sizeof(posMsg), dm2) && dm2.portnum == POSITION_APP;
         logCase("negative/edge", ok);
+        allOk &= ok;
+    }
+
+    // Full originate->receive loopback: Data -> encrypt -> header+ct on the TX
+    // side, then unpack -> decrypt -> decode on the RX side, round-trips exactly.
+    {
+        uint8_t key[16];
+        size_t kl = 0;
+        expandPsk(1, key, kl);
+        const char *msg = "loopback!";
+        size_t mlen = strlen(msg);
+        uint8_t data[64];
+        size_t dl = encodeData(TEXT_MESSAGE_APP, (const uint8_t *)msg, mlen, data, sizeof(data));
+        uint32_t from = 0xDEADBEEFu, id = 0x01020304u;
+        uint8_t nonce[16];
+        initNonce(from, id, nonce);
+        aesCtrCrypt(key, nonce, data, dl);
+        uint8_t frame[16 + 64];
+        PacketHeader h;
+        h.to = BROADCAST_ADDR;
+        h.from = from;
+        h.id = id;
+        h.flags = PacketHeader::makeFlags(3, false, 3);
+        h.channel = LONGFAST_CHANNEL_HASH;
+        packHeader(h, frame);
+        memcpy(frame + 16, data, dl);
+        size_t flen = 16 + dl;
+
+        PacketHeader rh;
+        bool ok = unpackHeader(frame, flen, rh) && rh.channel == LONGFAST_CHANNEL_HASH &&
+                  rh.from == from && rh.id == id && rh.hopLimit() == 3;
+        size_t ctl = flen - 16;
+        uint8_t pt[64];
+        memcpy(pt, frame + 16, ctl);
+        uint8_t n2[16];
+        initNonce(rh.from, rh.id, n2);
+        aesCtrCrypt(key, n2, pt, ctl);
+        DataMsg dm;
+        ok = ok && decodeData(pt, ctl, dm) && dm.portnum == TEXT_MESSAGE_APP && dm.payloadLen == mlen &&
+             bytesEq(dm.payload, (const uint8_t *)msg, mlen);
+        logCase("tx loopback", ok);
+        allOk &= ok;
+    }
+
+    // Duty-cycle accounting (deterministic, synthetic timing)
+    {
+        DutyCycle dc;
+        dc.windowMs = 10000; // 10 s window
+        dc.budgetMs = 1000;  // 1 s budget (10%)
+        bool ok = dc.usedMs(0) == 0 && !dc.wouldExceed(0, 500);
+        dc.record(0, 500);
+        dc.record(100, 400); // used = 900 within window
+        ok = ok && dc.usedMs(200) == 900;
+        ok = ok && !dc.wouldExceed(200, 100);  // 900+100 == 1000, allowed
+        ok = ok && dc.wouldExceed(200, 200);   // 900+200 > 1000, blocked
+        // wait until the first (500ms @ t=0) record leaves the 10s window
+        uint32_t wait = dc.msUntilAvailable(200, 200); // need to shed >=100 -> first rec frees 500
+        ok = ok && wait == (10000 - 200);
+        // after the window fully passes, budget is clear again
+        ok = ok && dc.usedMs(11000) == 0 && !dc.wouldExceed(11000, 1000);
+        logCase("duty-cycle", ok);
         allOk &= ok;
     }
 

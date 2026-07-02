@@ -79,6 +79,29 @@ void aesCtrCrypt(const uint8_t key[16], const uint8_t nonce[16], uint8_t *data, 
 // (length-delimited). Returns encoded length, or 0 on overflow.
 size_t encodeData(uint32_t portnum, const uint8_t *payload, size_t payloadLen, uint8_t *out, size_t outCap);
 
+// Rolling-window airtime accounting for the EU868 10% duty-cycle limit. Pure
+// and testable (all timing is passed in). Window/budget default to 1 hour / 10%.
+struct DutyCycle {
+    static constexpr size_t CAP = 64;
+    uint32_t atMs[CAP] = {0};
+    uint32_t airMs[CAP] = {0};
+    size_t count = 0; // number of valid records (ring, oldest evicted at CAP)
+    size_t head = 0;  // next write slot
+    uint32_t windowMs = 3600000UL;
+    uint32_t budgetMs = 360000UL; // 10% of the window
+
+    void reset() {
+        count = 0;
+        head = 0;
+    }
+    // Sum of airtime whose records still fall inside the rolling window at `now`.
+    uint32_t usedMs(uint32_t now) const;
+    bool wouldExceed(uint32_t now, uint32_t newAirMs) const { return usedMs(now) + newAirMs > budgetMs; }
+    void record(uint32_t now, uint32_t airMs);
+    // ms until enough in-window airtime ages out to admit newAirMs (0 if OK now).
+    uint32_t msUntilAvailable(uint32_t now, uint32_t newAirMs) const;
+};
+
 struct DataMsg {
     uint32_t portnum = 0;
     uint8_t payload[MAX_DATA_PAYLOAD] = {0};

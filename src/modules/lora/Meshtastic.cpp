@@ -7,6 +7,7 @@
 #include "modules/lora/LoRaRF.h"
 #include <Arduino.h>
 #include <RadioLib.h>
+#include <esp_system.h>
 #include <globals.h>
 
 extern BruceConfigPins bruceConfigPins;
@@ -59,6 +60,15 @@ bool selfTestPassed = false;
 // LongFast default-channel key, expanded once at start.
 uint8_t meshKey[16];
 size_t meshKeyLen = 0;
+
+// TX state (Phase 5).
+uint32_t ourNodeId = 0;              // stable 32-bit node-ID (from MAC)
+meshtastic::DutyCycle dutyCycle;     // EU868 10% airtime limiter
+uint32_t meshTxCount = 0;
+uint32_t lastTxAtMs = 0;
+volatile bool txInProgress = false;  // true only while transmit() is running
+bool lastTxBlocked = false;          // last send attempt was refused by the guard
+uint32_t lastTxBlockedWaitS = 0;
 
 void IRAM_ATTR onMeshPacket() {
     if (!meshIrqEnabled) return;
@@ -218,6 +228,94 @@ void decodeMeshFrame(const uint8_t *buf, size_t len, float rssi, float snr) {
     }
 }
 
+// Stable 32-bit node-ID from the ESP32 efuse MAC (low 4 bytes, Meshtastic-style).
+// MAC is fixed per device so this is stable across boots without extra storage.
+uint32_t deriveNodeId() {
+    uint64_t mac = ESP.getEfuseMac();
+    uint32_t id = (uint32_t)(mac & 0xFFFFFFFFu);
+    if (id == 0 || id == meshtastic::BROADCAST_ADDR) {
+        id = 0x0BACE000u | (uint32_t)((mac >> 32) & 0xFFF); // avoid reserved/broadcast
+    }
+    return id;
+}
+
+// Compose -> encode Data -> encrypt -> frame -> duty-cycle guard -> transmit ->
+// re-arm RX. This is the ONLY transmit path; it runs only on explicit user
+// action (compose/send or a serial trigger), never in a loop. Returns true on
+// a successful transmit; false if empty, encode-failed, blocked, or radio error.
+bool sendMeshText(const String &text) {
+    if (!meshRadio || text.length() == 0) return false;
+
+    uint8_t data[meshtastic::MAX_PLAINTEXT];
+    size_t dataLen =
+        meshtastic::encodeData(meshtastic::TEXT_MESSAGE_APP, (const uint8_t *)text.c_str(),
+                               text.length(), data, sizeof(data));
+    if (dataLen == 0) {
+        Serial.println("[Meshtastic] TX: message too long to encode");
+        return false;
+    }
+
+    uint32_t id = esp_random();
+    if (id == 0) id = 1; // id 0 is reserved / a poor nonce input
+
+    uint8_t nonce[16];
+    meshtastic::initNonce(ourNodeId, id, nonce);
+    meshtastic::aesCtrCrypt(meshKey, nonce, data, dataLen);
+
+    uint8_t frame[meshtastic::HEADER_LEN + meshtastic::MAX_PLAINTEXT];
+    meshtastic::PacketHeader h;
+    h.to = meshtastic::BROADCAST_ADDR;
+    h.from = ourNodeId;
+    h.id = id;
+    h.flags = meshtastic::PacketHeader::makeFlags(3, false, 3); // hop_limit=3, hop_start=3
+    h.channel = meshtastic::LONGFAST_CHANNEL_HASH;
+    meshtastic::packHeader(h, frame);
+    memcpy(frame + meshtastic::HEADER_LEN, data, dataLen);
+    size_t frameLen = meshtastic::HEADER_LEN + dataLen;
+
+    // --- Mandatory EU868 10% duty-cycle guard (non-negotiable, always in path) ---
+    uint32_t now = millis();
+    uint32_t airMs = meshRadio->getTimeOnAir(frameLen) / 1000;
+    if (dutyCycle.wouldExceed(now, airMs)) {
+        uint32_t waitMs = dutyCycle.msUntilAvailable(now, airMs);
+        lastTxBlocked = true;
+        lastTxBlockedWaitS = (waitMs + 999) / 1000;
+        Serial.printf(
+            "[Meshtastic] TX BLOCKED by duty cycle: pkt=%ums used=%ums/%ums budget, retry in ~%us\n",
+            airMs, dutyCycle.usedMs(now), dutyCycle.budgetMs, lastTxBlockedWaitS
+        );
+        return false;
+    }
+    lastTxBlocked = false;
+
+    // --- Transmit (half-duplex: mute RX IRQ, send, re-arm RX) ---
+    txInProgress = true;
+    meshIrqEnabled = false;
+    int st = meshRadio->transmit(frame, frameLen);
+    meshRadio->startReceive();
+    meshIrqEnabled = true;
+    txInProgress = false;
+
+    if (st != RADIOLIB_ERR_NONE) {
+        Serial.printf("[Meshtastic] TX failed: %d\n", st);
+        return false;
+    }
+
+    dutyCycle.record(now, airMs);
+    meshTxCount++;
+    lastTxAtMs = now;
+    // Show our own sent line in the local view too.
+    meshTextCount++;
+    lastText = String("(me) ") + text;
+    lastTextFrom = ourNodeId;
+    Serial.printf(
+        "[Meshtastic] TX #%lu id=0x%08x len=%u airtime=%ums used=%ums/%ums \"%s\"\n",
+        (unsigned long)meshTxCount, id, (unsigned)frameLen, airMs, dutyCycle.usedMs(now),
+        dutyCycle.budgetMs, text.c_str()
+    );
+    return true;
+}
+
 // Reads one pending frame, logs it raw with RF metrics, decodes it, re-arms RX.
 void processMeshRx() {
     if (!meshPacketReceived || !meshRadio) return;
@@ -267,16 +365,35 @@ void drawStatusScreen() {
 
     tft.setTextSize(FP);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    int y = 34;
+    char line[72];
+    int y = 30;
     tft.drawString("LongFast  EU868  869.525 MHz", 6, y);
     y += 12;
     tft.drawString("SF11 / BW250 / CR4:5  sync 0x2b", 6, y);
-    y += 16;
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.drawString("Listening (RX only)...", 6, y);
-    y += 16;
+    y += 12;
+    snprintf(line, sizeof(line), "node !%08x", ourNodeId);
+    tft.drawString(line, 6, y);
+    y += 12;
+    // Duty-cycle budget indicator.
+    uint32_t used = dutyCycle.usedMs(millis());
+    int pct = dutyCycle.budgetMs ? (int)((used * 100) / dutyCycle.budgetMs) : 0;
+    snprintf(line, sizeof(line), "duty: %d%% used  TX:%lu", pct, (unsigned long)meshTxCount);
+    tft.setTextColor(pct >= 100 ? TFT_RED : TFT_WHITE, TFT_BLACK);
+    tft.drawString(line, 6, y);
+    y += 14;
+    if (txInProgress) {
+        tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+        tft.drawString(">> TRANSMITTING <<", 6, y);
+    } else if (lastTxBlocked) {
+        tft.setTextColor(TFT_RED, TFT_BLACK);
+        snprintf(line, sizeof(line), "TX blocked (retry ~%lus)", (unsigned long)lastTxBlockedWaitS);
+        tft.drawString(line, 6, y);
+    } else {
+        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.drawString("Listening...", 6, y);
+    }
+    y += 14;
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    char line[64];
     snprintf(line, sizeof(line), "Frames heard: %lu", (unsigned long)meshRxCount);
     tft.drawString(line, 6, y);
     y += 12;
@@ -314,9 +431,14 @@ void meshtasticChannel() {
     meshTextCount = 0;
     lastText = "";
     lastTextFrom = 0;
+    meshTxCount = 0;
+    lastTxBlocked = false;
+    dutyCycle.reset();
 
     // Expand the LongFast default channel key (PSK index 1) once.
     meshtastic::expandPsk(1, meshKey, meshKeyLen);
+    ourNodeId = deriveNodeId();
+    Serial.printf("[Meshtastic] our node-ID: !%08x\n", ourNodeId);
 
     // Deterministic codec/crypto self-test (Appendix A) on every open, so a
     // regression is always visible before any radio traffic (mirrors recon).
@@ -346,14 +468,34 @@ void meshtasticChannel() {
     uint32_t lastHeartbeat = millis();
     uint32_t seenAtLastDraw = 0;
 
+    Serial.println("[Meshtastic] type a line on serial to transmit it as a text message");
+    String serialLine;
+
     while (true) {
         processMeshRx();
+
+        // Serial-triggered TX: lets sending be triggered/observed over USB (the
+        // on-screen compose keyboard is Phase 6). A full line = one text message.
+        while (Serial.available()) {
+            char c = (char)Serial.read();
+            if (c == '\n' || c == '\r') {
+                serialLine.trim();
+                if (serialLine.length() > 0) {
+                    Serial.printf("[Meshtastic] serial compose: \"%s\"\n", serialLine.c_str());
+                    sendMeshText(serialLine);
+                    drawStatusScreen();
+                }
+                serialLine = "";
+            } else if (serialLine.length() < 230) {
+                serialLine += c;
+            }
+        }
 
         if (millis() - lastHeartbeat > HEARTBEAT_MS) {
             lastHeartbeat = millis();
             Serial.printf(
-                "[Meshtastic] listening... frames=%lu uptime=%lus\n", (unsigned long)meshRxCount,
-                (unsigned long)(millis() / 1000)
+                "[Meshtastic] listening... frames=%lu tx=%lu uptime=%lus\n", (unsigned long)meshRxCount,
+                (unsigned long)meshTxCount, (unsigned long)(millis() / 1000)
             );
         }
 
