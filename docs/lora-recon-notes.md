@@ -153,6 +153,36 @@ Appendix A Unconfirmed-Up vector as the self-test), injected right after `resetS
 transmitter was available this session. All three screens, all navigation paths, and both
 lock modes were confirmed working end-to-end by the user across several flash/test rounds.
 
+## Phase 7 (optional extras, partial) — DONE
+
+User asked to compare against a related reference project
+([igorolhovskiy/lora-recon-m5-eu868](https://github.com/igorolhovskiy/lora-recon-m5-eu868), a
+host-side Python CLI+TUI for a different hardware setup — an M5Stack LoRaWAN-EU868 AT-command
+module, not on-device firmware) to check for gaps. Closed three: anomaly detection
+(DevNonce-replay + FCnt-regression, in-session fixed-size ring-evicted trackers), a DevEUI OUI
+hint (deliberately sparse — no verified real IEEE OUI-to-vendor data was findable via
+WebSearch/WebFetch, so only the one confirmed fact, Semtech's documented FE:FF:FF/FE:FF:FE test
+range, is included; fabricating vendor names was rejected as worse than no hint), and a third
+lock mode (`LockMode::Exact` — fix both channel+SF, no hopping, the brief's non-recommended
+alternative — via a new 'x' shortcut). Deliberately did **not** replicate the reference
+project's Cayenne LPP payload decoding, since that requires FRMPayload to be plaintext, directly
+contradicting the task brief's guardrail that FRMPayload is opaque/never decoded.
+SD logging and Meshtastic mode were not requested and remain unimplemented.
+
+User confirmed on-device: self-test still passes, footer/lock-line text updated correctly, and
+the 'x' exact-lock toggle works as designed (parks on one row marked 'X', unlocks correctly).
+
+## Phase 8 (polish, cross-board, docs) — DONE
+
+- Fixed a benign `%08X`/`uint32_t` format-string warning.
+- Cross-board compile check: `pio run -e lilygo-t-deck` (sibling T-Deck env, shares the
+  `LORA_BUSY` board-ini edit) and `pio run -e m5stack-cardputer` (default env, different board
+  family, no LoRa pins at all) both compile cleanly — confirms other board builds aren't
+  regressed.
+- `docs/lora-recon-README.md` — the feature README deliverable.
+- Final re-flash of `lilygo-t-deck-pro` with all fixes; clean boot and passing self-test
+  reconfirmed on hardware.
+
 ## Phase 4 (parser + self-test) — DONE
 
 Added `src/modules/lora/LoRaWANParser.{h,cpp}`: decodes MHDR/DevAddr/FCtrl/FCnt/FOpts (1.0.x
