@@ -127,6 +127,32 @@ not a labeled Esc** — Bruce maps `keyValue == 0x08` → `KeyStroke.del` → `E
   installed (`meshtastic`, `mesh-analysis`, `mesh-tunnel` in `.pyproject`) but no node was
   on hand at test time — worth asking again later.
 
+## Phase 6 (on-screen UI) — DONE
+
+Full 3-screen UI: Screen A (48-row scrollable channel×SF table + RX2 row), Screen B
+(captured-frames list), Screen C (frame detail, human-readable, word-wrapped/scrollable).
+Control scheme confirmed with user up front: Up/Down nav, Select=lock, `f`=frame list,
+`r`=reset stats, Backspace=back-one-level (T-Deck's physical Backspace key, not a labeled Esc).
+
+Two real bugs found during on-device testing and fixed:
+- **Screen flicker** — periodic `fillScreen()` + full row redraw every 250ms caused a visible
+  flash even with no new data. Fixed with a `viewNeedsFullClear` flag (static chrome drawn
+  once per view-entry) plus per-row/per-line content diffing (`sweepRowCache`,
+  `sweepLockLineCache`) so only genuinely-changed content gets redrawn.
+- **RX2 "lock" wasn't a real lock** — selecting the RX2 row used to just jump there once and
+  silently auto-resume the normal sweep after the 20s RX2 dwell, which looked like "lock is
+  lost" to the user. Replaced the old `bool lockEnabled` with `enum class LockMode { None, Sf,
+  Rx2 }`; `updateSweep()` now skips time-based advancement entirely while
+  `lockMode == Rx2`, so RX2-lock genuinely parks until manually unlocked. Added a dedicated
+  always-visible "LOCK: ..." status line (title-adjacent) since the earlier per-row 'L'
+  markers alone read as "sweep is stuck" rather than "lock is intentionally on."
+
+Screen C was verified visually using a **temporary** synthetic frame (built from the same
+Appendix A Unconfirmed-Up vector as the self-test), injected right after `resetStats()` in
+`loraRecon()` for one test round, then fully removed before the final commit — no live
+transmitter was available this session. All three screens, all navigation paths, and both
+lock modes were confirmed working end-to-end by the user across several flash/test rounds.
+
 ## Phase 4 (parser + self-test) — DONE
 
 Added `src/modules/lora/LoRaWANParser.{h,cpp}`: decodes MHDR/DevAddr/FCtrl/FCnt/FOpts (1.0.x
