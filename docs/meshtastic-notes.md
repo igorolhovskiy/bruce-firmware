@@ -1,0 +1,167 @@
+# Meshtastic LongRange — investigation notes
+
+Working notes for the "Meshtastic LF" feature (see `bruce-meshtastic-longrange-TASK.md` in the
+parent folder). Kept here so intermediate findings survive across sessions; will be folded into
+`docs/meshtastic-README.md` at Phase 9.
+
+> **This feature TRANSMITS.** Unlike LoRa Recon (receive-only), this is a two-way mesh text
+> client. The hard rules are duty-cycle compliance (EU868 10%), legal operation, antenna-before-power,
+> and never fabricating protocol data.
+
+## Toolchain / environment (reused from recon)
+
+- PlatformIO runs from `.pyproject-pio/` (Python 3.12 via `uv`; system 3.14 is too new for
+  `espressif32`). Activate before any `pio`: from `bruce-firmware/`, `source ../.pyproject-pio/bin/activate`.
+- Target env: **`lilygo-t-deck-pro`** (T-Deck Plus). Sibling `lilygo-t-deck` is the non-Plus board.
+- Serial: `/dev/ttyACM0` (confirmed present), 115200 baud.
+- Reference tooling: `meshtastic` Python lib 2.7.9 in `.pyproject` (talks to a node over API — does
+  NOT implement the on-air PHY crypto itself, so it is not directly a crypto-KAT generator).
+  `openssl` present and used to generate the AES-CTR KATs below.
+
+## Base branch decision — DECIDED
+
+- **Base = `lora-recon`** (user chose to stack both features so one build has Recon + Meshtastic).
+- Feature branch: **`meshtastic-longrange`**, branched from `lora-recon`.
+- **Antenna:** user confirmed EU868 antenna attached — safe to power radio and transmit.
+- **Interop peer:** none available right now — build + self-test + loopback verifiable this session;
+  live bidirectional interop (Phase 7) flagged as an unverified gap until a real node is on hand.
+
+## Bruce internals to reuse (confirmed against source)
+
+- **Menu extension point:** `LoRaMenu::optionsMenu()` (`src/core/menu_items/LoRaMenu.cpp:8`) — add a
+  `"Meshtastic"` entry to the `options` vector calling a new `meshtasticChannel()`. Same low-friction
+  pattern as recon's `"Recon"` entry; no new `MenuItemInterface`, no main-menu registration change.
+  Whole module gated `#if !defined(LITE_VERSION)`.
+- **Radio pin/SPI helpers:** `LoRaRF.h` exposes `getLoraIrqPin()/getLoraBusyPin()/getLoraResetPin()/
+  getLoraCsPin()/selectLoraSPIBus()`. `LORA_BUSY=13` already added to the board ini by recon. Our
+  module owns its own independent `SX1262`/`Module` instance built from these helpers (same as
+  `LoRaRecon.cpp`). RadioLib is `jgromes/RadioLib @ ^7.4.0`.
+- **RX pattern (recon):** ISR sets a `volatile bool` flag (`onReconPacket`), main loop polls it,
+  `readData()` + `getRSSI/getSNR/getTimeOnAir`, then `startReceive()` to re-arm. Guard with a
+  `reconIrqEnabled` flag while reading. We mirror this and ADD a TX path (time-shared on one radio).
+- **TX pattern (chat):** `LoRaRF.cpp:sendLoraMessage()` — disable IRQ, `radio->transmit(buf,len)`,
+  `startReceive()` to re-arm, re-enable IRQ. Blocking transmit is fine for our small payloads.
+- **Crypto:** `mbedtls/aes.h` already in-tree. Use `mbedtls_aes_crypt_ctr` for AES-128-CTR (see the
+  counter-compatibility note below — mbedtls matches Meshtastic for our packet sizes).
+- **Text input:** `keyboard(String, maxSize, msg, mask)` (`src/core/mykeyboard.h:5`). Returns `"\x1B"`
+  on cancel (see chat's `if (msg == "\x1B") return;`).
+- **Display:** `tft` global; `loopOptions()` for menus; `ScrollableTextArea`
+  (`src/core/scrollableTextArea.h`) for the message log. Input via `check(SelPress/EscPress/NextPress/
+  PrevPress/AnyKeyPress)`. **Back/exit key = physical Backspace/Delete (⌫) → `EscPress`** (recon Phase 2).
+- Letter shortcuts on the QWERTY keyboard: recon uses `checkLetterShortcutPress()` (throttled ~80ms).
+
+## Protocol anchoring — Meshtastic firmware source
+
+**Anchored against release `v2.7.26.54e0d8d` (master commit `86fd2069` at read time).** Every constant
+below was read from the actual firmware source (fetched from raw.githubusercontent.com), not memory.
+Files read: `src/mesh/CryptoEngine.cpp/.h`, `src/mesh/Channels.cpp/.h`, `src/mesh/RadioInterface.cpp/.h`,
+`src/mesh/MeshRadio.h`, `src/mesh/SX126xInterface.cpp`, `src/mesh/RadioLibInterface.h`,
+`meshtastic/protobufs/meshtastic/portnums.proto`.
+
+### Region EU_868 (`RadioInterface.cpp` `RDEF(EU_868, ...)`)
+`RDEF(EU_868, 869.4f, 869.65f, 10, 0, 27, false, false, false)` →
+freqStart 869.4, freqEnd 869.65, **dutyCycle 10%**, spacing 0, powerLimit 27 dBm. (SX1262 caps at
++22 dBm — cap `setOutputPower` there.)
+
+### Modem presets (`MeshRadio.h` `modemPresetToParams`, wideLora=false for EU868)
+| Preset | BW kHz | SF | CR |
+|---|---|---|---|
+| ShortFast | 250 | 7 | 4/5 |
+| MediumFast | 250 | 9 | 4/5 |
+| **LongFast (default)** | **250** | **11** | **4/5** |
+| LongModerate | 125 | 11 | 4/8 |
+| LongSlow | 125 | 12 | 4/8 |
+
+All match the brief §9 table.
+
+### Frequency slot (`RadioInterface.cpp`)
+`numChannels = floor((freqEnd-freqStart)/(spacing + bw/1000)) = floor(0.25/0.25) = 1`.
+`channel_num = hash("LongFast") % numChannels = 0x08 % 1 = 0`.
+`freq = freqStart + bw/2000 + channel_num*(bw/1000) = 869.4 + 0.125 + 0 =` **869.525 MHz**. ✓
+
+### PHY LoRa settings
+- Sync word **`0x2b`** (`RadioLibInterface.h:84 const uint8_t syncWord = 0x2b;`). Passed to RadioLib
+  `setSyncWord(0x2b)` — same RadioLib API Bruce already uses, so byte-compatible.
+- Preamble length **16** (`RadioInterface.h:98`).
+- **CRC ON** (`SX126xInterface.cpp:201 setCRC(RADIOLIB_SX126X_LORA_CRC_ON)`).
+- Explicit header, standard IQ (uplink).
+
+### On-air frame = PacketHeader (16 bytes, LE) + AES-CTR ciphertext
+`RadioInterface.h` `PacketHeader` — layout confirmed exactly as brief §9:
+| Off | Size | Field |
+|---|---|---|
+| 0 | 4 | `to` (LE) — 0xFFFFFFFF = broadcast |
+| 4 | 4 | `from` (LE) |
+| 8 | 4 | `id` (LE) — crypto nonce input |
+| 12 | 1 | `flags` — bits0-2 hop_limit, bit3 want_ack, bit4 via_mqtt, bits5-7 hop_start |
+| 13 | 1 | `channel` — channel-hash byte |
+| 14 | 1 | `next_hop` (0 if unknown) |
+| 15 | 1 | `relay_node` (0 if unknown) |
+Flag masks confirmed: `HOP_LIMIT_MASK 0x07`, `WANT_ACK_MASK 0x08`, `VIA_MQTT_MASK 0x10`,
+`HOP_START_MASK 0xE0`, `HOP_START_SHIFT 5`.
+
+### Channel hash (`Channels.cpp` `generateHash` / `xorHash`)
+`hash = xorHash(name) ^ xorHash(psk)`, `xorHash` = XOR of all bytes. For name `"LongFast"` +
+default PSK: `xorHash("LongFast")=0x0A`, `xorHash(defaultpsk)=0x02` → **channel hash = 0x08**.
+(Verified independently in Python.)
+
+### Default channel key (PSK index 1) (`Channels.h:144 defaultpsk[]`)
+```
+d4 f1 bb 3a 20 29 07 59 f0 bc ff ab cf 4e 69 01   (AES-128, 16 bytes)
+```
+Expansion (`Channels.cpp getKey`): psk.size==1 → index byte. index 0 = no encryption; index 1 =
+defaultpsk verbatim; index N = defaultpsk with **last byte += (N-1)**. Confirmed.
+
+### AES-CTR nonce (`CryptoEngine.cpp` `initNonce` + `encryptAESCtr`)
+`encryptPacket(fromNode, packetId, ...)` → `initNonce(fromNode, packetId)` (extraNonce defaults 0):
+```
+memcpy(nonce,   &packetId, 8);   // uint64 LE  (our 32-bit id zero-extended)
+memcpy(nonce+8, &fromNode, 4);   // uint32 LE
+// nonce[12..15] = 0
+```
+So the 16-byte IV/counter block = `id[0..3] LE | 00 00 00 00 | from[0..3] LE | 00 00 00 00`.
+`encryptAESCtr`: `CTR<AES128>`, `setIV(nonce,16)`, `setCounterSize(4)` → the **last 4 bytes** are the
+incrementing counter, high 12 bytes fixed. Decrypt == encrypt (CTR). `MAX_BLOCKSIZE` gate.
+
+**mbedtls compatibility note (critical):** `mbedtls_aes_crypt_ctr` increments the *entire* 16-byte
+nonce_counter as a 128-bit big-endian counter. Meshtastic (rweather CTR, counterSize=4) increments
+only the last 4 bytes. These are **identical** as long as the last-4-byte counter never overflows
+into byte 11 — i.e. for any packet under 2^32 blocks, always true here (max payload ~237 B ≈ 15
+blocks). Since bytes 12-15 start at 0, mbedtls's big-endian carry only ever touches byte 15 then 14…
+matching rweather exactly. So **mbedtls AES-CTR is byte-compatible** for this use. Validated by KAT below.
+
+### Data protobuf (`mesh.proto` message `Data`)
+`portnum` = field 1 (varint), `payload` = field 2 (length-delimited bytes). `PortNum` (portnums.proto):
+`UNKNOWN_APP=0, TEXT_MESSAGE_APP=1, REMOTE_HARDWARE_APP=2, POSITION_APP=3, NODEINFO_APP=4,
+ROUTING_APP=5, ADMIN_APP=6`. For a text message: field1=1, field2=UTF-8 text. Hand-rollable
+encode/decode with a tiny varint + length-delimited reader. Ignore unknown fields; never over-read.
+
+## Self-test vectors (deterministic, generated — not hand-fabricated)
+
+### A.1 Data protobuf — "hi"
+`Data{portnum=1, payload="hi"}` = `08 01 12 02 68 69` (6 bytes). Hand-verified against wire format.
+
+### A.2 Default key — see above (assert PSK-expansion of index 1 == defaultpsk).
+
+### A.3 Channel hash LongFast = **0x08** (derived, verified in Python).
+
+### A.4 AES-CTR KATs (generated with `openssl enc -aes-128-ctr`)
+Key `d4f1bb3a20290759f0bcffabcf4e6901`, nonce/IV `cdab0000000000007856341200000000`
+(id=0x0000ABCD, from=0x12345678):
+- **Single-block:** pt `080112026869` → ct `4d7577d5e002`.
+- **Multi-block (21 B, crosses block boundary):** pt `0801121148656c6c6f204d65736874617374696321`
+  ("Hello Meshtastic!") → ct `4d7577c6c00e0100bb3e87cbe91c868e5769652ac0`.
+  (First 3 ct bytes match the single-block ct — same keystream block 0 — confirming counter/IV setup;
+  the boundary-crossing bytes prove mbedtls's counter increment matches Meshtastic's.)
+Firmware self-test must: reproduce both ciphertexts from plaintext, and decrypt both back.
+
+### A.5 Header pack/unpack
+`to=0xFFFFFFFF, from=0x12345678, id=0x0000ABCD, hop_limit=3, channel=0x08, next_hop=0, relay_node=0`
+→ 16 LE bytes `ff ff ff ff 78 56 34 12 cd ab 00 00 03 08 00 00` → round-trips. 10-byte buffer rejected.
+
+## Open decisions / to relay to user
+- Base branch (main vs lora-recon) — §5.1.
+- **Antenna safety:** EU868 antenna MUST be attached before radio power; TX into a missing/mismatched
+  antenna can destroy the PA. Confirm before Phase 3.
+- Interop gear for Phase 7: a real Meshtastic node/app on EU_868 / LongFast / default key.
+- Node-ID source: derive a stable 32-bit ID from the ESP32 MAC, persist it. Display `!%08x`.
