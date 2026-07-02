@@ -1,5 +1,6 @@
 #if !defined(LITE_VERSION)
 #include "LoRaRecon.h"
+#include "LoRaWANParser.h"
 #include "core/configPins.h"
 #include "core/display.h"
 #include "modules/lora/LoRaRF.h"
@@ -142,8 +143,15 @@ void processReconPacket() {
             crcOk ? "OK" : "MISMATCH", hex.c_str()
         );
 
-        lastFrameSummary = "#" + String(reconPacketCount) + " len=" + String((unsigned)len) +
-                            " rssi=" + String(rssi, 1) + "dBm" + (crcOk ? "" : " CRC!");
+        LoRaWANFrame decoded = parseLoRaWANFrame(buf, len);
+        Serial.printf("[LoRaRecon] decoded: %s\n", decoded.mtypeName.c_str());
+        for (const String &line : describeLoRaWANFrame(decoded)) {
+            Serial.print("  - ");
+            Serial.println(line);
+        }
+
+        lastFrameSummary = "#" + String(reconPacketCount) + " " + decoded.mtypeName + " rssi=" +
+                            String(rssi, 1) + "dBm" + (crcOk ? "" : " CRC!");
     } else {
         Serial.printf("[LoRaRecon] RX read failed: %d\n", state);
     }
@@ -164,8 +172,17 @@ void loraRecon() {
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     char cfgLine[48];
     snprintf(cfgLine, sizeof(cfgLine), "%.3f MHz  SF%u  BW%.0f", RECON_FREQ_MHZ, RECON_SF, RECON_BW_KHZ);
-    tft.drawCentreString(cfgLine, tftWidth / 2, tftHeight / 2 - 20, 1);
-    tft.drawCentreString("passive, receive-only", tftWidth / 2, tftHeight / 2 - 8, 1);
+    tft.drawCentreString(cfgLine, tftWidth / 2, tftHeight / 2 - 30, 1);
+    tft.drawCentreString("passive, receive-only", tftWidth / 2, tftHeight / 2 - 18, 1);
+
+    // Deterministic parser check (synthetic vectors, no radio traffic needed)
+    // runs every time this screen opens, so a regression is always visible.
+    bool selfTestOk = runLoRaWANParserSelfTest();
+    tft.setTextColor(selfTestOk ? TFT_GREEN : TFT_RED, TFT_BLACK);
+    tft.drawCentreString(
+        selfTestOk ? "parser self-test: OK" : "parser self-test: FAILED", tftWidth / 2, tftHeight / 2 - 6, 1
+    );
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
 
     reconPacketCount = 0;
     lastFrameSummary = "no frames yet";
