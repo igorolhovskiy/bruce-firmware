@@ -157,6 +157,9 @@ Also, [read our FAQ](https://wiki.bruce.computer/faq/)
 - [x] [LoRa Recon](./docs/lora-recon-README.md) - passive, receive-only LoRa/LoRaWAN
   reconnaissance (EU868): channel/SF sweep, human-readable frame decode, replay/FCnt anomaly
   hints. T-Deck Plus only for now.
+- [x] [Meshtastic LF](./docs/meshtastic-README.md) - two-way Meshtastic text client on the default
+  LongFast channel (EU868): receive/decrypt/display and compose/encrypt/send text, heard-nodes list,
+  duty-cycle limited. Interoperates with stock Meshtastic (default key). T-Deck Plus only for now.
 </details>
 
 <details>
