@@ -9,6 +9,7 @@
 #include <RadioLib.h>
 #include <esp_system.h>
 #include <globals.h>
+#include <vector>
 
 extern BruceConfigPins bruceConfigPins;
 
@@ -51,11 +52,10 @@ float lastRxRssi = 0;
 float lastRxSnr = 0;
 uint32_t lastRxAtMs = 0;
 
-// Decoded-traffic snapshot (Phase 4). Full conversation/nodes store is Phase 6.
+// Decoded-traffic counters.
 uint32_t meshTextCount = 0;
-String lastText;
-uint32_t lastTextFrom = 0;
 bool selfTestPassed = false;
+bool needsRedraw = true;
 
 // LongFast default-channel key, expanded once at start.
 uint8_t meshKey[16];
@@ -69,6 +69,63 @@ uint32_t lastTxAtMs = 0;
 volatile bool txInProgress = false;  // true only while transmit() is running
 bool lastTxBlocked = false;          // last send attempt was refused by the guard
 uint32_t lastTxBlockedWaitS = 0;
+
+// --- UI state (Phase 6) ---
+enum class View { Conversation, Nodes };
+View view = View::Conversation;
+bool viewFullClear = true; // fillScreen once per view entry, then only sub-regions
+
+struct ConvMsg {
+    uint32_t from;
+    bool mine;
+    String text;
+    float rssi;
+    float snr;
+    uint32_t atMs;
+};
+std::vector<ConvMsg> convo; // oldest at front, newest at back
+constexpr size_t MAX_CONVO = 60;
+int convScroll = 0; // lines scrolled up from the bottom (0 = pinned to newest)
+
+struct NodeEnt {
+    uint32_t id;
+    uint32_t lastSeenMs;
+    float rssi;
+    float snr;
+    uint32_t count;
+};
+std::vector<NodeEnt> nodes;
+constexpr size_t MAX_NODES = 48;
+int nodesCursor = 0;
+int nodesTop = 0;
+
+// Records/updates a heard node from any decoded frame's `from` field.
+void touchNode(uint32_t id, float rssi, float snr) {
+    for (auto &n : nodes) {
+        if (n.id == id) {
+            n.lastSeenMs = millis();
+            n.rssi = rssi;
+            n.snr = snr;
+            n.count++;
+            return;
+        }
+    }
+    if (nodes.size() >= MAX_NODES) nodes.erase(nodes.begin()); // evict oldest-inserted
+    nodes.push_back({id, millis(), rssi, snr, 1});
+}
+
+void addConvMsg(uint32_t from, bool mine, const String &text, float rssi, float snr) {
+    ConvMsg m;
+    m.from = from;
+    m.mine = mine;
+    m.text = text;
+    m.rssi = rssi;
+    m.snr = snr;
+    m.atMs = millis();
+    convo.push_back(m);
+    if (convo.size() > MAX_CONVO) convo.erase(convo.begin());
+    if (convScroll != 0) convScroll++; // keep the same messages in view when not pinned to bottom
+}
 
 void IRAM_ATTR onMeshPacket() {
     if (!meshIrqEnabled) return;
@@ -182,8 +239,8 @@ void decodeMeshFrame(const uint8_t *buf, size_t len, float rssi, float snr) {
     }
     Serial.printf(
         "[Meshtastic]   hdr to=!%08x from=!%08x id=0x%08x flags=0x%02x ch=0x%02x hop=%u/%u nh=%u rn=%u\n",
-        hdr.to, hdr.from, hdr.id, hdr.flags, hdr.channel, hdr.hopLimit(), hdr.hopStart(), hdr.next_hop,
-        hdr.relay_node
+        (unsigned)hdr.to, (unsigned)hdr.from, (unsigned)hdr.id, hdr.flags, hdr.channel, hdr.hopLimit(),
+        hdr.hopStart(), hdr.next_hop, hdr.relay_node
     );
 
     if (hdr.channel != meshtastic::LONGFAST_CHANNEL_HASH) {
@@ -211,19 +268,22 @@ void decodeMeshFrame(const uint8_t *buf, size_t len, float rssi, float snr) {
         Serial.println("[Meshtastic]   decrypt->protobuf undecodable (foreign key or non-Data), ignored");
         return;
     }
-    Serial.printf("[Meshtastic]   decoded portnum=%u (%s) payloadLen=%u\n", dm.portnum,
+    Serial.printf("[Meshtastic]   decoded portnum=%u (%s) payloadLen=%u\n", (unsigned)dm.portnum,
                   portName(dm.portnum).c_str(), (unsigned)dm.payloadLen);
+
+    // Any successfully-decoded frame proves a heard node on this channel.
+    touchNode(hdr.from, rssi, snr);
 
     if (dm.portnum == meshtastic::TEXT_MESSAGE_APP) {
         String text;
         text.reserve(dm.payloadLen + 1);
         for (size_t i = 0; i < dm.payloadLen; i++) text += (char)dm.payload[i];
         meshTextCount++;
-        lastText = text;
-        lastTextFrom = hdr.from;
+        addConvMsg(hdr.from, false, text, rssi, snr);
+        if (view == View::Conversation) needsRedraw = true;
         Serial.printf(
-            "[Meshtastic]   >>> TEXT from !%08x: \"%s\" (rssi=%.0fdBm snr=%.1fdB)\n", hdr.from, text.c_str(),
-            rssi, snr
+            "[Meshtastic]   >>> TEXT from !%08x: \"%s\" (rssi=%.0fdBm snr=%.1fdB)\n", (unsigned)hdr.from,
+            text.c_str(), rssi, snr
         );
     }
 }
@@ -282,7 +342,8 @@ bool sendMeshText(const String &text) {
         lastTxBlockedWaitS = (waitMs + 999) / 1000;
         Serial.printf(
             "[Meshtastic] TX BLOCKED by duty cycle: pkt=%ums used=%ums/%ums budget, retry in ~%us\n",
-            airMs, dutyCycle.usedMs(now), dutyCycle.budgetMs, lastTxBlockedWaitS
+            (unsigned)airMs, (unsigned)dutyCycle.usedMs(now), (unsigned)dutyCycle.budgetMs,
+            (unsigned)lastTxBlockedWaitS
         );
         return false;
     }
@@ -304,14 +365,13 @@ bool sendMeshText(const String &text) {
     dutyCycle.record(now, airMs);
     meshTxCount++;
     lastTxAtMs = now;
-    // Show our own sent line in the local view too.
-    meshTextCount++;
-    lastText = String("(me) ") + text;
-    lastTextFrom = ourNodeId;
+    // Show our own sent line in the conversation view.
+    addConvMsg(ourNodeId, true, text, 0, 0);
+    needsRedraw = true;
     Serial.printf(
         "[Meshtastic] TX #%lu id=0x%08x len=%u airtime=%ums used=%ums/%ums \"%s\"\n",
-        (unsigned long)meshTxCount, id, (unsigned)frameLen, airMs, dutyCycle.usedMs(now),
-        dutyCycle.budgetMs, text.c_str()
+        (unsigned long)meshTxCount, (unsigned)id, (unsigned)frameLen, (unsigned)airMs,
+        (unsigned)dutyCycle.usedMs(now), (unsigned)dutyCycle.budgetMs, text.c_str()
     );
     return true;
 }
@@ -357,69 +417,206 @@ void processMeshRx() {
     meshIrqEnabled = true;
 }
 
-void drawStatusScreen() {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextSize(FM);
-    tft.setTextColor(bruceConfig.priColor, TFT_BLACK);
-    tft.drawCentreString("Meshtastic LF", tftWidth / 2, 8, 1);
+// ---------------------------------------------------------------------------
+// UI layout (320x240, FP font). Two persistent views (Conversation / Nodes)
+// plus a modal compose via keyboard(). Chrome + footer are shared. Redraws
+// touch only sub-regions (never a periodic fillScreen) to stay flicker-free;
+// a full clear happens once per view entry via viewFullClear.
+// ---------------------------------------------------------------------------
+constexpr int CHROME_H = 30;        // two chrome rows + separator
+constexpr int FOOTER_H = 12;        // one footer row
+constexpr int ROW_H = 11;           // body line height (FP)
 
+String shortText(const String &s, size_t maxChars) {
+    if (s.length() <= maxChars) return s;
+    return s.substring(0, maxChars);
+}
+
+// Shared top chrome: title + node-ID, then preset/freq + duty budget + TX state.
+void drawChrome() {
+    tft.fillRect(0, 0, tftWidth, CHROME_H, TFT_BLACK);
     tft.setTextSize(FP);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    char line[72];
-    int y = 30;
-    tft.drawString("LongFast  EU868  869.525 MHz", 6, y);
-    y += 12;
-    tft.drawString("SF11 / BW250 / CR4:5  sync 0x2b", 6, y);
-    y += 12;
-    snprintf(line, sizeof(line), "node !%08x", ourNodeId);
-    tft.drawString(line, 6, y);
-    y += 12;
-    // Duty-cycle budget indicator.
+    char line[80];
+
+    tft.setTextColor(bruceConfig.priColor, TFT_BLACK);
+    snprintf(line, sizeof(line), "Meshtastic LF  !%08x", (unsigned)ourNodeId);
+    tft.drawString(line, 4, 2);
+
     uint32_t used = dutyCycle.usedMs(millis());
     int pct = dutyCycle.budgetMs ? (int)((used * 100) / dutyCycle.budgetMs) : 0;
-    snprintf(line, sizeof(line), "duty: %d%% used  TX:%lu", pct, (unsigned long)meshTxCount);
-    tft.setTextColor(pct >= 100 ? TFT_RED : TFT_WHITE, TFT_BLACK);
-    tft.drawString(line, 6, y);
-    y += 14;
-    if (txInProgress) {
-        tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-        tft.drawString(">> TRANSMITTING <<", 6, y);
-    } else if (lastTxBlocked) {
-        tft.setTextColor(TFT_RED, TFT_BLACK);
-        snprintf(line, sizeof(line), "TX blocked (retry ~%lus)", (unsigned long)lastTxBlockedWaitS);
-        tft.drawString(line, 6, y);
-    } else {
-        tft.setTextColor(TFT_GREEN, TFT_BLACK);
-        tft.drawString("Listening...", 6, y);
+    const char *st = txInProgress ? "TX>>" : (lastTxBlocked ? "BLK" : "RX");
+    tft.setTextColor(
+        txInProgress ? TFT_ORANGE : (lastTxBlocked || pct >= 100 ? TFT_RED : TFT_GREEN), TFT_BLACK
+    );
+    snprintf(line, sizeof(line), "LongFast 869.5  duty:%d%%  TX:%lu  %s", pct, (unsigned long)meshTxCount, st);
+    tft.drawString(line, 4, 14);
+
+    tft.drawFastHLine(0, CHROME_H - 2, tftWidth, TFT_DARKGREY);
+}
+
+void drawFooter(const char *hint) {
+    tft.fillRect(0, tftHeight - FOOTER_H, tftWidth, FOOTER_H, TFT_BLACK);
+    tft.setTextSize(FP);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.drawString(hint, 4, tftHeight - FOOTER_H + 1);
+}
+
+// Screen A - conversation. Newest at bottom; own messages ">> ..." in priColor,
+// others "!from: ..." in white with an RF tag. convScroll pages up from bottom.
+void drawConversation() {
+    if (viewFullClear) {
+        tft.fillScreen(TFT_BLACK);
+        viewFullClear = false;
     }
-    y += 14;
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    snprintf(line, sizeof(line), "Frames heard: %lu", (unsigned long)meshRxCount);
-    tft.drawString(line, 6, y);
-    y += 12;
-    if (meshRxCount > 0) {
-        snprintf(
-            line, sizeof(line), "last: len=%u %.0fdBm %.1fdB %lus ago", (unsigned)lastRxLen, lastRxRssi,
-            lastRxSnr, (unsigned long)((millis() - lastRxAtMs) / 1000)
-        );
-        tft.drawString(line, 6, y);
+    drawChrome();
+
+    int bodyTop = CHROME_H;
+    int bodyH = tftHeight - CHROME_H - FOOTER_H;
+    int rows = bodyH / ROW_H;
+    tft.fillRect(0, bodyTop, tftWidth, bodyH, TFT_BLACK);
+    tft.setTextSize(FP);
+
+    int total = (int)convo.size();
+    // Bottom-anchored window; convScroll shifts it toward older messages.
+    int end = total - convScroll;      // one past last visible
+    if (end > total) end = total;
+    if (end < 0) end = 0;
+    int start = end - rows;
+    if (start < 0) start = 0;
+
+    int y = bodyTop + (bodyH - (end - start) * ROW_H); // bottom-align if few msgs
+    if (y < bodyTop) y = bodyTop;
+    char meta[48];
+    for (int i = start; i < end; i++) {
+        const ConvMsg &m = convo[i];
+        if (m.mine) {
+            tft.setTextColor(bruceConfig.priColor, TFT_BLACK);
+            tft.drawString(shortText(">> " + m.text, 50), 4, y);
+        } else {
+            tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            snprintf(meta, sizeof(meta), "!%08x", (unsigned)m.from);
+            tft.drawString(shortText(String(meta) + ": " + m.text, 44), 4, y);
+            tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+            snprintf(meta, sizeof(meta), "%.0f/%.0f", m.rssi, m.snr);
+            tft.drawString(meta, tftWidth - tft.textWidth(meta) - 4, y);
+        }
+        y += ROW_H;
     }
-    y += 16;
-    snprintf(line, sizeof(line), "Text msgs: %lu", (unsigned long)meshTextCount);
-    tft.drawString(line, 6, y);
-    if (meshTextCount > 0) {
-        y += 12;
-        tft.setTextColor(bruceConfig.priColor, TFT_BLACK);
-        char t[64];
-        snprintf(t, sizeof(t), "!%08x: %s", lastTextFrom, lastText.c_str());
-        tft.drawString(String(t).substring(0, 40), 6, y);
-        tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    if (convo.empty()) {
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawCentreString("no messages yet", tftWidth / 2, bodyTop + bodyH / 2, 1);
     }
 
-    tft.setTextColor(selfTestPassed ? TFT_GREEN : TFT_RED, TFT_BLACK);
-    tft.drawString(selfTestPassed ? "self-test: OK" : "self-test: FAIL", 6, tftHeight - 28);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawCentreString("Backspace to exit", tftWidth / 2, tftHeight - 16, 1);
+    drawFooter(convScroll > 0 ? "SEL compose  n nodes  ^v scroll(older)  <-exit"
+                              : "SEL compose  n nodes  ^ scroll  <-exit");
+}
+
+// Screen C - nodes heard on the channel. node-ID / last RSSI-SNR / count / age.
+void drawNodes() {
+    if (viewFullClear) {
+        tft.fillScreen(TFT_BLACK);
+        viewFullClear = false;
+    }
+    drawChrome();
+
+    int bodyTop = CHROME_H;
+    int bodyH = tftHeight - CHROME_H - FOOTER_H;
+    int rows = bodyH / ROW_H;
+    tft.fillRect(0, bodyTop, tftWidth, bodyH, TFT_BLACK);
+    tft.setTextSize(FP);
+
+    if (nodesCursor < nodesTop) nodesTop = nodesCursor;
+    if (nodesCursor >= nodesTop + rows) nodesTop = nodesCursor - rows + 1;
+
+    char line[80];
+    int shown = 0;
+    for (int i = nodesTop; i < (int)nodes.size() && shown < rows; i++, shown++) {
+        const NodeEnt &n = nodes[i];
+        int y = bodyTop + shown * ROW_H;
+        bool sel = (i == nodesCursor);
+        if (sel) tft.fillRect(0, y - 1, tftWidth, ROW_H, bruceConfig.priColor);
+        tft.setTextColor(sel ? TFT_BLACK : TFT_WHITE, sel ? bruceConfig.priColor : TFT_BLACK);
+        uint32_t ageS = (millis() - n.lastSeenMs) / 1000;
+        snprintf(
+            line, sizeof(line), "!%08x  %.0f/%.0f  x%lu  %lus", (unsigned)n.id, n.rssi, n.snr,
+            (unsigned long)n.count, (unsigned long)ageS
+        );
+        tft.drawString(line, 4, y);
+    }
+    if (nodes.empty()) {
+        tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        tft.drawCentreString("no nodes heard yet", tftWidth / 2, bodyTop + bodyH / 2, 1);
+    }
+
+    char cnt[40];
+    snprintf(cnt, sizeof(cnt), "%d nodes  ^v move  n/<- back", (int)nodes.size());
+    drawFooter(cnt);
+}
+
+void drawCurrentView() {
+    if (view == View::Conversation) drawConversation();
+    else drawNodes();
+}
+
+// Modal compose using Bruce's on-device QWERTY keyboard, then encrypt+send.
+void composeAndSend() {
+    String text = keyboard("", 230, "Type message:");
+    viewFullClear = true; // keyboard took the whole screen
+    if (text.length() == 0 || text == "\x1B") {
+        needsRedraw = true;
+        return;
+    }
+    sendMeshText(text); // duty-cycle guarded inside; appends to convo on success
+    needsRedraw = true;
+}
+
+void handleConversationInput() {
+    if (check(PrevPress) || check(UpPress)) {
+        int maxScroll = (int)convo.size();
+        if (convScroll < maxScroll) convScroll++;
+        needsRedraw = true;
+    }
+    if (check(NextPress) || check(DownPress)) {
+        if (convScroll > 0) convScroll--;
+        needsRedraw = true;
+    }
+    if (check(SelPress)) {
+        composeAndSend();
+    }
+    static uint32_t lastShortcut = 0;
+    if (millis() - lastShortcut > 80) {
+        lastShortcut = millis();
+        char c = checkLetterShortcutPress();
+        if (c == 'c' || c == 'C') composeAndSend();
+        else if (c == 'n' || c == 'N') {
+            view = View::Nodes;
+            nodesCursor = 0;
+            nodesTop = 0;
+            viewFullClear = true;
+            needsRedraw = true;
+        }
+    }
+}
+
+void handleNodesInput() {
+    if (check(PrevPress) || check(UpPress)) {
+        if (nodesCursor > 0) nodesCursor--;
+        needsRedraw = true;
+    }
+    if (check(NextPress) || check(DownPress)) {
+        if (nodesCursor < (int)nodes.size() - 1) nodesCursor++;
+        needsRedraw = true;
+    }
+    static uint32_t lastShortcut = 0;
+    if (millis() - lastShortcut > 80) {
+        lastShortcut = millis();
+        char c = checkLetterShortcutPress();
+        if (c == 'n' || c == 'N') {
+            view = View::Conversation;
+            viewFullClear = true;
+            needsRedraw = true;
+        }
+    }
 }
 
 } // namespace
@@ -429,8 +626,6 @@ void meshtasticChannel() {
     meshRxCount = 0;
     lastRxLen = 0;
     meshTextCount = 0;
-    lastText = "";
-    lastTextFrom = 0;
     meshTxCount = 0;
     lastTxBlocked = false;
     dutyCycle.reset();
@@ -438,7 +633,7 @@ void meshtasticChannel() {
     // Expand the LongFast default channel key (PSK index 1) once.
     meshtastic::expandPsk(1, meshKey, meshKeyLen);
     ourNodeId = deriveNodeId();
-    Serial.printf("[Meshtastic] our node-ID: !%08x\n", ourNodeId);
+    Serial.printf("[Meshtastic] our node-ID: !%08x\n", (unsigned)ourNodeId);
 
     // Deterministic codec/crypto self-test (Appendix A) on every open, so a
     // regression is always visible before any radio traffic (mirrors recon).
@@ -464,9 +659,18 @@ void meshtasticChannel() {
         }
     }
 
-    drawStatusScreen();
+    view = View::Conversation;
+    convo.clear();
+    nodes.clear();
+    convScroll = 0;
+    nodesCursor = 0;
+    nodesTop = 0;
+    viewFullClear = true;
+    needsRedraw = true;
+    drawCurrentView();
+
     uint32_t lastHeartbeat = millis();
-    uint32_t seenAtLastDraw = 0;
+    uint32_t lastChromeTick = millis();
 
     Serial.println("[Meshtastic] type a line on serial to transmit it as a text message");
     String serialLine;
@@ -474,8 +678,8 @@ void meshtasticChannel() {
     while (true) {
         processMeshRx();
 
-        // Serial-triggered TX: lets sending be triggered/observed over USB (the
-        // on-screen compose keyboard is Phase 6). A full line = one text message.
+        // Serial-triggered TX: lets sending be triggered/observed over USB, in
+        // addition to the on-screen compose keyboard. A full line = one message.
         while (Serial.available()) {
             char c = (char)Serial.read();
             if (c == '\n' || c == '\r') {
@@ -483,7 +687,7 @@ void meshtasticChannel() {
                 if (serialLine.length() > 0) {
                     Serial.printf("[Meshtastic] serial compose: \"%s\"\n", serialLine.c_str());
                     sendMeshText(serialLine);
-                    drawStatusScreen();
+                    needsRedraw = true;
                 }
                 serialLine = "";
             } else if (serialLine.length() < 230) {
@@ -499,14 +703,33 @@ void meshtasticChannel() {
             );
         }
 
-        // Only redraw when a new frame actually arrives - no periodic fillScreen,
-        // so an idle (no-peer) screen stays flicker-free. Full diffed UI is Phase 6.
-        if (meshRxCount != seenAtLastDraw) {
-            seenAtLastDraw = meshRxCount;
-            drawStatusScreen();
+        // Refresh once a second so the duty-cycle % and node ages stay current
+        // (sub-region redraw only, never a full-screen fill -> no flicker).
+        if (millis() - lastChromeTick > 1000) {
+            lastChromeTick = millis();
+            needsRedraw = true;
         }
 
-        if (check(EscPress)) break;
+        // Input (per view). Backspace exits from Conversation, or backs out of
+        // Nodes into Conversation.
+        if (view == View::Conversation) {
+            if (check(EscPress)) break;
+            handleConversationInput();
+        } else {
+            if (check(EscPress)) {
+                view = View::Conversation;
+                viewFullClear = true;
+                needsRedraw = true;
+            } else {
+                handleNodesInput();
+            }
+        }
+
+        if (needsRedraw) {
+            needsRedraw = false;
+            drawCurrentView();
+        }
+
         delay(5);
     }
 
