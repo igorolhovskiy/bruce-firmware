@@ -15,6 +15,7 @@
 #include "modules/wifi/responder.h"
 #include "modules/wifi/scan_hosts.h"
 #include "modules/wifi/sniffer.h"
+#include "modules/wifi/wifi_analyzer.h"
 #include "modules/wifi/wifi_atks.h"
 
 #ifndef LITE_VERSION
@@ -57,6 +58,7 @@ void WifiMenu::optionsMenu() {
     if (WiFi.getMode() == WIFI_MODE_STA || WiFi.getMode() == WIFI_MODE_APSTA) {
         options.push_back({"AP info", displayAPInfo});
     }
+    options.push_back({"WiFi Analyzer", wifi_analyzer});
     options.push_back({"Wifi Atks", wifi_atk_menu});
     options.push_back({"Evil Portal", [=]() {
                            // WebUI cleanup now handled automatically inside EvilPortal constructor
