@@ -11,7 +11,7 @@ extern bool showHiddenNetworks; // defined in WifiMenu.cpp
 // ─── Graph geometry (320x240 landscape) ──────────────────────────────────────
 static const int PLOT_L = 26;  // left edge of plot (room for dBm labels)
 static const int PLOT_T = 16;  // top edge (below header)
-static const int PLOT_B = 210; // baseline (above channel labels)
+static const int PLOT_B = 198; // baseline (leaves room for channel labels + footer)
 #define PLOT_R (tftWidth - 3)
 
 // dBm range shown on the y-axis
@@ -88,8 +88,19 @@ static void renderGraph(tft_sprite &spr, std::vector<ApEntry> &aps, int highligh
     const double pxPerCh = (double)(PLOT_R - PLOT_L) / (CH_MAX - CH_MIN);
     const double sigma = pxPerCh * 1.6; // curve half-width ~1.6 channels
 
+    (void)sigma; // bar view: no gaussian spread needed
     spr.fillScreen(bg);
     spr.setTextSize(1);
+
+    // Per-channel bar slotting so APs sharing a channel sit side by side
+    int chCount[CH_MAX + 1] = {0};
+    for (auto &a : aps) chCount[constrain(a.channel, CH_MIN, CH_MAX)]++;
+    std::vector<int> slotIdx(aps.size());
+    int chSeen[CH_MAX + 1] = {0};
+    for (size_t i = 0; i < aps.size(); i++) {
+        int c = constrain(aps[i].channel, CH_MIN, CH_MAX);
+        slotIdx[i] = chSeen[c]++;
+    }
 
     // ── Header ──
     spr.setTextColor(bruceConfig.priColor);
@@ -117,35 +128,34 @@ static void renderGraph(tft_sprite &spr, std::vector<ApEntry> &aps, int highligh
         spr.drawString(String(ch), chanToX(ch), PLOT_B + 3);
     }
 
-    // ── Bell curves (highlighted one drawn last, on top) ──
+    // ── Bars (highlighted one drawn last, on top) ──
+    const double colW = pxPerCh * 0.85; // width shared by all bars on a channel
     for (int pass = 0; pass < 2; pass++) {
         for (size_t i = 0; i < aps.size(); i++) {
             bool isHi = ((int)i == highlight);
             if ((pass == 0) == isHi) continue; // pass0: others, pass1: highlighted
 
             ApEntry &ap = aps[i];
-            int centerX = chanToX(ap.channel);
+            int ch = constrain(ap.channel, CH_MIN, CH_MAX);
+            int n = chCount[ch] < 1 ? 1 : chCount[ch];
+            double slotW = colW / n;
+            int barW = (int)slotW - 1;
+            if (barW < 2) barW = 2;
+            int bx = (int)lround(chanToX(ch) - colW / 2 + slotIdx[i] * slotW);
             int peakY = rssiToY(ap.rssi);
-            uint16_t fill = dim565(ap.color, isHi ? 5 : 3, 10);
+            int barH = PLOT_B - peakY;
+            uint16_t fill = dim565(ap.color, isHi ? 6 : 3, 10);
 
-            int prevX = -1, prevY = 0;
-            for (int x = PLOT_L; x <= PLOT_R; x++) {
-                double dx = (x - centerX);
-                double frac = exp(-(dx * dx) / (2.0 * sigma * sigma));
-                if (frac < 0.02) continue;
-                int curveY = PLOT_B - (int)lround((PLOT_B - peakY) * frac);
-                spr.drawFastVLine(x, curveY, PLOT_B - curveY, fill);
-                if (prevX >= 0) spr.drawLine(prevX, prevY, x, curveY, ap.color);
-                prevX = x;
-                prevY = curveY;
-            }
+            spr.fillRect(bx, peakY, barW, barH, fill);
+            spr.drawRect(bx, peakY, barW, barH, ap.color);
+            if (isHi) spr.drawRect(bx + 1, peakY + 1, barW - 2, barH - 2, ap.color);
 
-            // SSID label above the peak
+            // SSID label above the bar
             if (peakY - 2 > PLOT_T + 6) {
                 spr.setTextColor(ap.color);
                 spr.setTextDatum(BC_DATUM);
                 const char *name = ap.ssid[0] ? ap.ssid : "<hidden>";
-                spr.drawString(name, centerX, peakY - 2);
+                spr.drawString(name, bx + barW / 2, peakY - 2);
             }
         }
     }
