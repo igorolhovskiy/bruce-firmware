@@ -337,9 +337,16 @@ void decodeMeshFrame(const uint8_t *buf, size_t len, float rssi, float snr) {
     touchNode(hdr.from, rssi, snr);
 
     if (dm.portnum == meshtastic::TEXT_MESSAGE_APP) {
+        // Guard: only surface/log genuinely displayable text. A binary payload
+        // (mis-routed protobuf, wrong-key/collision garbage) is dropped here so it
+        // never paints as symbols on screen nor lands in the SD log as garbage.
         String text;
-        text.reserve(dm.payloadLen + 1);
-        for (size_t i = 0; i < dm.payloadLen; i++) text += (char)dm.payload[i];
+        if (!meshtastic::sanitizeDisplayText(dm.payload, dm.payloadLen, text) || text.length() == 0) {
+            Serial.printf(
+                "[Meshtastic]   TEXT payload not displayable (binary/non-text), not shown or logged\n"
+            );
+            return;
+        }
         meshTextCount++;
         addConvMsg(hdr.from, false, text, rssi, snr);
         if (view == View::Conversation) needsRedraw = true;

@@ -282,6 +282,24 @@ it. Revisit with a real node/app on EU_868 / LongFast / default key to close the
 - `docs/meshtastic-README.md` written (feature README deliverable).
 - No new format/compile warnings in the Meshtastic sources.
 
+## Phase 10 (post-ship fix) — displayable-text guard on the RX text path
+Symptom reported by user: a received frame rendered as "a symbol line" on screen, and the
+SD log's rx `text` field held binary bytes (looked like a hexdump). Root cause found by decoding
+the on-card `meshtastic_log.csv`: the offending frame was a **NODEINFO `User` record** from node
+`waza` (`!6c72ff04`, long_name `waza🇫🇷74` incl. a 🇫🇷 flag emoji, short_name `waza`, macaddr,
+hw_model, role, 32-byte public_key) that had been surfaced as if it were message text — so the
+protobuf tag bytes + MAC/public-key + emoji drew as symbols and were written into the CSV text field.
+
+Fix: `meshtastic::sanitizeDisplayText(payload, len, out)` in the codec. Keeps printable ASCII
+verbatim; collapses `\n`/`\r`/`\t` to a single space (keeps display + CSV single-line); replaces any
+valid non-ASCII UTF-8 code point (emoji/accents the device font can't render) with `?`; and returns
+**false** on a C0 control byte (other than tab/newline/CR), DEL, or malformed UTF-8 — i.e. binary
+payloads (mis-routed protobuf, wrong-key/1-byte-channel-hash-collision garbage). RX text path in
+`Meshtastic.cpp` now drops such frames (not shown, not logged). This also fixes the SD log: only clean
+text ever reaches `logMeshMsg` now, so the CSV stays human-readable text (no binary blobs).
+New self-test case `text guard`. **Verified on hardware:** self-test PASSED 11/11 (adds `text guard`),
+flashed to `lilygo-t-deck-pro` (Flash 79.6% / RAM 39.0%), radio up clean.
+
 ## Open decisions / to relay to user
 - Base branch (main vs lora-recon) — §5.1.
 - **Antenna safety:** EU868 antenna MUST be attached before radio power; TX into a missing/mismatched

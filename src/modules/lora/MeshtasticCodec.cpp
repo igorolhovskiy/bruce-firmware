@@ -230,6 +230,38 @@ bool decodeUserName(const uint8_t *buf, size_t len, char *longName, size_t longC
     return found;
 }
 
+bool sanitizeDisplayText(const uint8_t *payload, size_t len, String &out) {
+    out = "";
+    out.reserve(len + 1);
+    size_t i = 0;
+    while (i < len) {
+        uint8_t b = payload[i];
+        if (b < 0x80) { // ASCII range
+            if (b == '\n' || b == '\r' || b == '\t') {
+                out += ' '; // keep on one line, keep the CSV field single-line
+                i++;
+            } else if (b < 0x20 || b == 0x7F) {
+                return false; // C0 control / DEL -> binary, not a text message
+            } else {
+                out += (char)b; // printable ASCII kept verbatim
+                i++;
+            }
+        } else { // UTF-8 multi-byte lead: validate the whole sequence
+            size_t seqLen;
+            if ((b & 0xE0) == 0xC0) seqLen = 2;
+            else if ((b & 0xF0) == 0xE0) seqLen = 3;
+            else if ((b & 0xF8) == 0xF0) seqLen = 4;
+            else return false; // continuation byte as lead, or > 4-byte form: malformed
+            if (i + seqLen > len) return false; // truncated sequence
+            for (size_t j = 1; j < seqLen; j++)
+                if ((payload[i + j] & 0xC0) != 0x80) return false; // bad continuation byte
+            out += '?'; // valid code point the device font can't render -> placeholder
+            i += seqLen;
+        }
+    }
+    return true;
+}
+
 uint32_t DutyCycle::usedMs(uint32_t now) const {
     uint32_t sum = 0;
     for (size_t i = 0; i < count; i++) {
@@ -452,6 +484,31 @@ bool runMeshtasticSelfTest() {
         char ln2[40], sn2[8];
         ok = ok && !decodeUserName(bad, sizeof(bad), ln2, sizeof(ln2), sn2, sizeof(sn2));
         logCase("nodeinfo name", ok);
+        allOk &= ok;
+    }
+
+    // Displayable-text guard: plain ASCII passes verbatim; emoji/accents become
+    // '?'; a mis-routed NODEINFO User protobuf (has C0 control bytes) is rejected.
+    {
+        String s;
+        bool ok = sanitizeDisplayText((const uint8_t *)"hi there", 8, s) && s == "hi there";
+        // "waza" + U+1F1EB U+1F1F7 (flag, two 4-byte code points) + "74" -> "waza??74"
+        const uint8_t emoji[] = {'w',  'a',  'z',  'a',  0xf0, 0x9f, 0x87, 0xab,
+                                 0xf0, 0x9f, 0x87, 0xb7, '7',  '4'};
+        String s2;
+        ok = ok && sanitizeDisplayText(emoji, sizeof(emoji), s2) && s2 == "waza??74";
+        // real NODEINFO User payload (starts 0a 09 ... has 0x12 control byte) -> rejected
+        const uint8_t user[] = {0x0a, 0x09, '!', '1', '2', '3', '4', '5', '6', '7', '8', 0x12, 0x02, 'T', 'N'};
+        String s3;
+        ok = ok && !sanitizeDisplayText(user, sizeof(user), s3);
+        // truncated UTF-8 sequence (lead byte, no continuation) -> rejected
+        const uint8_t trunc[] = {'a', 0xf0, 0x9f};
+        String s4;
+        ok = ok && !sanitizeDisplayText(trunc, sizeof(trunc), s4);
+        // newline/tab collapse to a space (stays one CSV line / one display row)
+        String s5;
+        ok = ok && sanitizeDisplayText((const uint8_t *)"a\nb\tc", 5, s5) && s5 == "a b c";
+        logCase("text guard", ok);
         allOk &= ok;
     }
 

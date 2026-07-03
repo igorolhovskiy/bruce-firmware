@@ -118,6 +118,16 @@ bool decodeData(const uint8_t *buf, size_t len, DataMsg &out);
 bool decodeUserName(const uint8_t *buf, size_t len, char *longName, size_t longCap, char *shortName,
                     size_t shortCap);
 
+// Validate that a decoded TEXT_MESSAGE_APP payload is genuinely displayable text
+// and build a render-safe string in `out`: printable ASCII is kept verbatim,
+// tab/newline/CR collapse to a single space, and every valid non-ASCII UTF-8
+// code point (emoji, accents, ...) becomes '?' since the device font can't render
+// it. Returns FALSE when the payload is not real text -- a C0 control byte (other
+// than tab/newline/CR), DEL, or malformed UTF-8 -- which is how a mis-routed
+// protobuf (e.g. a NODEINFO User record) or wrong-key/collision garbage looks;
+// such frames must not be surfaced or logged as messages.
+bool sanitizeDisplayText(const uint8_t *payload, size_t len, String &out);
+
 // Deterministic Appendix-A self-test (no radio). Logs each sub-result to serial.
 bool runMeshtasticSelfTest();
 
