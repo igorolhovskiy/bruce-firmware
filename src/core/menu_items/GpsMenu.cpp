@@ -12,6 +12,7 @@ void GpsMenu::optionsMenu() {
 #if !defined(LITE_VERSION)
         {"GPS Tracker", [=]() { GPSTracker(); }       },
 #endif
+        {"Sync Clock",  []() { GPSTracker(false).syncTime(); }},
         {"Config",      [this]() { configMenu(); }    },
     };
     addOptionToMainMenu();

@@ -18,6 +18,9 @@ public:
     // Constructor
     /////////////////////////////////////////////////////////////////////////////////////
     GPSTracker();
+    // Pass startTracker=false to build the object without launching the tracker loop
+    // (used by syncTime(), which reuses the same GPS power/serial/pin handling).
+    explicit GPSTracker(bool startTracker);
     ~GPSTracker();
 
     /////////////////////////////////////////////////////////////////////////////////////
@@ -25,6 +28,9 @@ public:
     /////////////////////////////////////////////////////////////////////////////////////
     void setup();
     void loop();
+
+    // Set the ESP32 system clock from the GPS date/time (UTC), then return.
+    void syncTime();
 
 private:
     bool date_time_updated = false;

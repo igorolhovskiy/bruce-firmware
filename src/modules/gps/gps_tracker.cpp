@@ -11,10 +11,16 @@
 #include "core/mykeyboard.h"
 #include "core/sd_functions.h"
 #include "current_year.h"
+#include <sys/time.h>
+#include <time.h>
 
 #define MAX_WAIT 5000
 
 GPSTracker::GPSTracker() { setup(); }
+
+GPSTracker::GPSTracker(bool startTracker) {
+    if (startTracker) setup();
+}
 
 GPSTracker::~GPSTracker() {
     add_final_file_data();
@@ -36,6 +42,75 @@ void GPSTracker::setup() {
     if (!begin_gps()) return;
 
     return loop();
+}
+
+void GPSTracker::syncTime() {
+    ioExpander.turnPinOnOff(IO_EXP_GPS, HIGH);
+#ifdef USE_BOOST
+    PPM.enableOTG();
+#endif
+    drawMainBorderWithTitle("GPS Clock Sync");
+    padprintln("");
+    padprintln("Initializing GPS...");
+
+    if (!begin_gps()) return; // handles Esc / no-serial and calls end()
+
+    padprintln("Waiting for time fix...");
+    int count = 0;
+    bool done = false;
+    while (!done) {
+        if (check(EscPress)) break;
+
+        while (GPSserial.available() > 0) gps.encode(GPSserial.read());
+
+        // A valid, sane year means the GPS has a real time solution.
+        if (gps.date.isValid() && gps.time.isValid() && gps.date.year() >= CURRENT_YEAR &&
+            gps.date.year() < CURRENT_YEAR + 5) {
+            // GPS time is UTC; set the system clock from it (matches Bruce's manual clock path).
+            rtc.setTime(
+                gps.time.second(),
+                gps.time.minute(),
+                gps.time.hour(),
+                gps.date.day(),
+                gps.date.month(),
+                gps.date.year()
+            );
+            struct tm t = rtc.getTimeStruct();
+            time_t epoch = mktime(&t);
+            struct timeval tv = {.tv_sec = epoch};
+            settimeofday(&tv, nullptr);
+            clock_set = true;
+            done = true;
+        } else {
+            displayTextLine("Waiting for time: " + String(count) + "s");
+            count++;
+            if (count > 120) break; // ~2 min timeout
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+        }
+    }
+
+    if (done) {
+        drawMainBorderWithTitle("GPS Clock Sync");
+        padprintln("");
+        padprintf(2, "Clock set (UTC):\n");
+        padprintf(
+            2,
+            "%04d-%02d-%02d %02d:%02d:%02d\n",
+            gps.date.year(),
+            gps.date.month(),
+            gps.date.day(),
+            gps.time.hour(),
+            gps.time.minute(),
+            gps.time.second()
+        );
+        padprintln("");
+        padprintln("Press any key to exit");
+        while (!check(AnyKeyPress)) vTaskDelay(50 / portTICK_PERIOD_MS);
+    } else {
+        displayError("No GPS time fix");
+    }
+
+    end();
 }
 
 bool GPSTracker::begin_gps() {
