@@ -19,6 +19,13 @@
 #define GPIO_NUM_25 25
 #endif
 
+// On boards whose keyboard/touch own the primary I2C bus (Wire), the board header
+// routes Grove I2C units to a dedicated secondary bus (Wire1) so probing/using them
+// can't reconfigure or clobber the keyboard bus. Falls back to Wire otherwise.
+#ifndef GROVE_I2C_WIRE
+#define GROVE_I2C_WIRE Wire
+#endif
+
 namespace {
 bool waitReadyPreferIrq(Adafruit_PN532 &nfc, uint16_t timeoutMs) {
     if (nfc._irq >= 0) {
@@ -255,7 +262,11 @@ PN532::PN532(CONNECTION_TYPE connection_type) {
     _connection_type = connection_type;
     _use_i2c = (connection_type == I2C || connection_type == I2C_SPI);
     if (connection_type == CONNECTION_TYPE::I2C)
-        nfc.setInterface(bruceConfigPins.i2c_bus.sda, bruceConfigPins.i2c_bus.scl);
+        // setInterface(sda, scl) hardcodes the default Wire; bind the I2C device to
+        // GROVE_I2C_WIRE instead so the keyboard's Wire bus is left untouched.
+        nfc.i2c_dev = new Adafruit_I2CDevice(
+            PN532_I2C_ADDRESS, bruceConfigPins.i2c_bus.sda, bruceConfigPins.i2c_bus.scl, &GROVE_I2C_WIRE
+        );
 #ifdef M5STICK
     else if (connection_type == CONNECTION_TYPE::I2C_SPI) nfc.setInterface(GPIO_NUM_26, GPIO_NUM_25);
 #endif
@@ -276,13 +287,13 @@ bool PN532::begin() {
         Wire.begin(bruceConfigPins.i2c_bus.sda, bruceConfigPins.i2c_bus.scl);
     }
 #else
-    Wire.begin(bruceConfigPins.i2c_bus.sda, bruceConfigPins.i2c_bus.scl);
+    GROVE_I2C_WIRE.begin(bruceConfigPins.i2c_bus.sda, bruceConfigPins.i2c_bus.scl);
 #endif
 
     bool i2c_check = true;
     if (_use_i2c) {
-        Wire.beginTransmission(PN532_I2C_ADDRESS);
-        int error = Wire.endTransmission();
+        GROVE_I2C_WIRE.beginTransmission(PN532_I2C_ADDRESS);
+        int error = GROVE_I2C_WIRE.endTransmission();
         i2c_check = (error == 0);
     }
 
@@ -431,8 +442,8 @@ int PN532::emulate() {
 
     if (_use_i2c) {
         // PN532 target mode is sensitive to ESP32 I2C timing/clock stretching.
-        Wire.setClock(100000);
-        Wire.setTimeOut(50);
+        GROVE_I2C_WIRE.setClock(100000);
+        GROVE_I2C_WIRE.setTimeOut(50);
     }
     // `begin()` already wakes and SAMConfig's the PN532. Avoid reusing Adafruit's I2C RDY polling path here.
 

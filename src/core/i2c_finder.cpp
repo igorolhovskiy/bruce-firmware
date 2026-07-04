@@ -44,9 +44,9 @@ uint8_t find_first_i2c_address() {
     return 0;
 }
 
-bool check_i2c_address(uint8_t i2c_address) {
-    Wire.begin(bruceConfigPins.i2c_bus.sda, bruceConfigPins.i2c_bus.scl);
-    Wire.beginTransmission(i2c_address);
-    int error = Wire.endTransmission();
+bool check_i2c_address(uint8_t i2c_address, TwoWire &wire) {
+    wire.begin(bruceConfigPins.i2c_bus.sda, bruceConfigPins.i2c_bus.scl);
+    wire.beginTransmission(i2c_address);
+    int error = wire.endTransmission();
     return (error == 0);
 }

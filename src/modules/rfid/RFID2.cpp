@@ -16,10 +16,17 @@
 
 #define RFID2_I2C_ADDRESS 0x28
 
+// On boards whose keyboard/touch own the primary I2C bus (Wire), the board header
+// routes Grove I2C units to a dedicated secondary bus so they can't clobber it.
+#ifndef GROVE_I2C_WIRE
+#define GROVE_I2C_WIRE Wire
+#endif
+
 RFID2::RFID2(bool use_i2c) : _use_i2c(use_i2c) {
     if (use_i2c)
-        _driver =
-            new MFRC522DriverI2C{RFID2_I2C_ADDRESS, bruceConfigPins.i2c_bus.sda, bruceConfigPins.i2c_bus.scl};
+        _driver = new MFRC522DriverI2C{
+            RFID2_I2C_ADDRESS, bruceConfigPins.i2c_bus.sda, bruceConfigPins.i2c_bus.scl, GROVE_I2C_WIRE
+        };
     else _driver = new MFRC522DriverSPI{ss_pin, SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN};
     mfrc522.SetDriver(*_driver);
 }
@@ -27,7 +34,8 @@ RFID2::RFID2(bool use_i2c) : _use_i2c(use_i2c) {
 RFID2::~RFID2() { delete _driver; }
 
 bool RFID2::begin() {
-    bool i2c_check = check_i2c_address(RFID2_I2C_ADDRESS);
+    bool i2c_check = _use_i2c ? check_i2c_address(RFID2_I2C_ADDRESS, GROVE_I2C_WIRE)
+                              : check_i2c_address(RFID2_I2C_ADDRESS);
 
     mfrc522.PCD_Init();
 

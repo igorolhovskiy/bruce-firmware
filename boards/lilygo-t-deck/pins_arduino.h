@@ -23,6 +23,12 @@ static const uint8_t LED_BUILTIN = SOC_GPIO_PIN_COUNT+PIN_NEOPIXEL;
 #define HAS_KEYBOARD_HID //has keyboard to use
 #define KB_HID_EXIT_MSG "Mid Btn + Space to exit"
 
+// The keyboard, trackball and touch controller own the primary I2C bus (Wire)
+// on GPIO18/8. External I2C units on the Grove port (e.g. M5 RFID2) must use the
+// secondary bus (Wire1) so probing/using them can't reconfigure or clobber the
+// keyboard bus. Boards that don't define this fall back to Wire.
+#define GROVE_I2C_WIRE Wire1
+
 static const uint8_t TX = 43;
 static const uint8_t RX = 44;
 
