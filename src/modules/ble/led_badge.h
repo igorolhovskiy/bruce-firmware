@@ -57,6 +57,7 @@ void ledBadgeMenu();
 // Headless helpers for serial commands.
 bool ledBadgeSendText(const String &text); // one message, default options
 void ledBadgeSelfTest();                    // encode "Hello", print hex, assert framing
+void ledBadgeScanDump();                    // dump all advertising BLE devices to serial
 
 #endif
 #endif

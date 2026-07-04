@@ -218,6 +218,7 @@ bool sendBadgePacket(const std::vector<uint8_t> &packet) {
             found = true;
         }
     }
+    scan->stop();
     scan->clearResults();
 
     if (!found) {
@@ -229,11 +230,23 @@ bool sendBadgePacket(const std::vector<uint8_t> &packet) {
     Serial.printf("[LEDBadge] Connecting to %s...\n", addr.toString().c_str());
     displayTextLine("Connecting...");
     NimBLEClient *client = NimBLEDevice::createClient();
-    client->setConnectTimeout(5);
+#ifdef NIMBLE_V2_PLUS
+    client->setConnectTimeout(10 * 1000); // NimBLE 2.x: milliseconds
+#else
+    client->setConnectTimeout(10); // NimBLE 1.x: seconds
+#endif
 
     bool ok = false;
     do {
-        if (!client->connect(addr)) {
+        bool connected = false;
+        for (int attempt = 0; attempt < 3 && !connected; ++attempt) {
+            if (attempt) {
+                Serial.printf("[LEDBadge] Connect retry %d...\n", attempt + 1);
+                delay(500);
+            }
+            connected = client->connect(addr);
+        }
+        if (!connected) {
             Serial.println("[LEDBadge] Connect failed.");
             break;
         }
@@ -288,6 +301,51 @@ bool ledBadgeSendText(const String &text) {
     m.text = text;
     std::vector<LedBadgeMessage> msgs = {m};
     return sendBadgePacket(buildBadgePacket(msgs));
+}
+
+void ledBadgeScanDump() {
+    if (!NimBLEDevice::isInitialized()) NimBLEDevice::init("");
+    NimBLEScan *scan = NimBLEDevice::getScan();
+    scan->setActiveScan(true);
+    scan->setInterval(100);
+    scan->setWindow(99);
+
+    Serial.println("[LEDBadge] Scanning 6s, dumping all devices...");
+#ifdef NIMBLE_V2_PLUS
+    NimBLEScanResults results = scan->getResults(6 * 1000, false);
+#else
+    NimBLEScanResults results = scan->start(6, false);
+#endif
+    Serial.printf("[LEDBadge] %d device(s) found:\n", results.getCount());
+    for (int i = 0; i < results.getCount(); ++i) {
+#ifdef NIMBLE_V2_PLUS
+        const NimBLEAdvertisedDevice *adv = results.getDevice(i);
+        String name = String(adv->getName().c_str());
+        String addr = String(adv->getAddress().toString().c_str());
+        int rssi = adv->getRSSI();
+        int nUuids = adv->getServiceUUIDCount();
+        String svcs = "";
+        for (int u = 0; u < nUuids; ++u) svcs += String(adv->getServiceUUID(u).toString().c_str()) + " ";
+#else
+        NimBLEAdvertisedDevice adv = results.getDevice(i);
+        String name = String(adv.getName().c_str());
+        String addr = String(adv.getAddress().toString().c_str());
+        int rssi = adv.getRSSI();
+        int nUuids = adv.getServiceUUIDCount();
+        String svcs = "";
+        for (int u = 0; u < nUuids; ++u) svcs += String(adv.getServiceUUID(u).toString().c_str()) + " ";
+#endif
+        Serial.printf(
+            "  [%2d] %-24s rssi=%-4d name=\"%s\" svc=[ %s]\n",
+            i,
+            addr.c_str(),
+            rssi,
+            name.c_str(),
+            svcs.c_str()
+        );
+    }
+    scan->clearResults();
+    Serial.println("[LEDBadge] Scan done.");
 }
 
 void ledBadgeSelfTest() {

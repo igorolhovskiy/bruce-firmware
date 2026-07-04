@@ -20,6 +20,10 @@ static uint32_t ledBadgeCallback(cmd *c) {
         ledBadgeSelfTest();
         return true;
     }
+    if (first.equalsIgnoreCase("scan")) {
+        ledBadgeScanDump();
+        return true;
+    }
 
     // Rejoin all tokens as the message text (boundless split on spaces).
     String text = "";
