@@ -1,5 +1,5 @@
 #include "mic.h"
-#if defined(MIC_SPM1423) || defined(MIC_INMP441)
+#if defined(MIC_SPM1423) || defined(MIC_INMP441) || defined(MIC_ES7210)
 #include "core/mykeyboard.h"
 #include "core/powerSave.h"
 #include "core/settings.h"
@@ -32,6 +32,9 @@ static uint16_t posData = 0;
 #endif
 #ifndef PIN_DATA
 #define PIN_DATA I2S_PIN_NO_CHANGE
+#endif
+#ifndef PIN_MCLK
+#define PIN_MCLK I2S_GPIO_UNUSED // codecs like the ES7210 need an MCLK; MEMS mics don't
 #endif
 
 #ifdef PIN_BCLK
@@ -138,7 +141,7 @@ bool InitI2SMicroPhone() {
     chan_cfg.dma_desc_num = 8;
     chan_cfg.dma_frame_num = SPECTRUM_HEIGHT;
     esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &i2s_chan);
-#if defined(MIC_INMP441) // #ifdef PIN_WS // INMP441
+#if defined(MIC_INMP441) || defined(MIC_ES7210) // #ifdef PIN_WS // INMP441 / ES7210 codec
     i2s_std_slot_config_t slot_cfg =
         I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
     slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_16BIT;
@@ -146,7 +149,7 @@ bool InitI2SMicroPhone() {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MIC_SAMPLE_RATE),
         .slot_cfg = slot_cfg,
         .gpio_cfg = {
-                     .mclk = I2S_GPIO_UNUSED,
+                     .mclk = (gpio_num_t)PIN_MCLK,
                      .bclk = (gpio_num_t)PIN_CLK,
                      .ws = (gpio_num_t)PIN_WS,
                      .dout = I2S_GPIO_UNUSED,
@@ -998,7 +1001,7 @@ bool mic_capture_samples(
         if (err != ESP_OK) break;
 
         // Configure I2S with custom sample rate
-#if defined(MIC_INMP441)
+#if defined(MIC_INMP441) || defined(MIC_ES7210)
         i2s_std_slot_config_t slot_cfg =
             I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
         slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_16BIT;
@@ -1007,7 +1010,7 @@ bool mic_capture_samples(
             .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sampleRate), // Custom sample rate
             .slot_cfg = slot_cfg,
             .gpio_cfg = {
-                         .mclk = I2S_GPIO_UNUSED,
+                         .mclk = (gpio_num_t)PIN_MCLK,
                          .bclk = (gpio_num_t)PIN_CLK,
                          .ws = (gpio_num_t)PIN_WS,
                          .dout = I2S_GPIO_UNUSED,
