@@ -23,6 +23,7 @@ public:
         WRITE_MODE,
         WRITE_NDEF_MODE,
         EMULATE_MODE,
+        NTAG_TOOLS_MODE,
         ERASE_MODE,
         LOAD_MODE,
         SAVE_MODE
@@ -95,6 +96,11 @@ private:
     void erase_card();
     void write_data();
     void write_ndef_data();
+    void ntag_tools();
+    void ntag_read_signature();
+    void ntag_read_counter();
+    void ntag_set_password();
+    void ntag_remove_password();
     void save_file();
     void save_scan_result();
     void load_file();

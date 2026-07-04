@@ -39,6 +39,14 @@ public:
     int load();
     int save(String filename);
 
+    /////////////////////////////////////////////////////////////////////////////////////
+    // NTAG21x tools
+    /////////////////////////////////////////////////////////////////////////////////////
+    int read_signature(String &out) override;
+    int read_counter(uint32_t &out) override;
+    int set_password(uint32_t pwd, uint16_t pack) override;
+    int remove_password(uint32_t pwd) override;
+
 private:
     bool _use_i2c;
     MFRC522Driver *_driver;
@@ -48,6 +56,11 @@ private:
     // tried during authentication in addition to the built-in and user-saved keys.
     std::vector<std::array<uint8_t, 6>> _dictKeys;
     void load_key_dictionary();
+
+    // NTAG21x raw-command helpers
+    bool ntag_transceive(byte *cmd, byte cmdLen, byte *response, byte *responseLen);
+    bool ntag_activate();
+    bool ntag_cfg0_page(byte &cfg0);
 
     /////////////////////////////////////////////////////////////////////////////////////
     // Converters

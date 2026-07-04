@@ -684,3 +684,126 @@ int RFID2::write_ndef_blocks() {
 
     return SUCCESS;
 }
+
+/////////////////////////////////////////////////////////////////////////////////////
+// NTAG21x tools
+/////////////////////////////////////////////////////////////////////////////////////
+
+bool RFID2::ntag_activate() {
+    byte atqa[2];
+    byte atqaSize = sizeof(atqa);
+    mfrc522.PICC_WakeupA(atqa, &atqaSize); // wake a halted card
+    return mfrc522.PICC_ReadCardSerial();  // anticollision + select
+}
+
+bool RFID2::ntag_transceive(byte *cmd, byte cmdLen, byte *response, byte *responseLen) {
+    byte buffer[18];
+    if ((byte)(cmdLen + 2) > (byte)sizeof(buffer)) return false;
+
+    memcpy(buffer, cmd, cmdLen);
+    if (mfrc522.PCD_CalculateCRC(buffer, cmdLen, &buffer[cmdLen]) != MFRC522::StatusCode::STATUS_OK)
+        return false;
+
+    byte validBits = 0;
+    MFRC522::StatusCode status =
+        mfrc522.PCD_TransceiveData(buffer, cmdLen + 2, response, responseLen, &validBits, 0, true);
+    return status == MFRC522::StatusCode::STATUS_OK;
+}
+
+bool RFID2::ntag_cfg0_page(byte &cfg0) {
+    switch (totalPages) {
+        case 45: cfg0 = 0x29; return true;  // NTAG213
+        case 135: cfg0 = 0x83; return true; // NTAG215
+        case 231: cfg0 = 0xE3; return true; // NTAG216
+        default: return false;
+    }
+}
+
+int RFID2::read_signature(String &out) {
+    if (!ntag_activate()) return TAG_NOT_PRESENT;
+
+    byte cmd[2] = {0x3C, 0x00}; // READ_SIG
+    byte response[34];
+    byte responseLen = sizeof(response);
+    if (!ntag_transceive(cmd, 2, response, &responseLen) || responseLen < 32) {
+        mfrc522.PICC_HaltA();
+        return FAILURE;
+    }
+
+    out = "";
+    for (int i = 0; i < 32; i++) {
+        out += response[i] < 0x10 ? "0" : "";
+        out += String(response[i], HEX);
+    }
+    out.toUpperCase();
+    mfrc522.PICC_HaltA();
+    return SUCCESS;
+}
+
+int RFID2::read_counter(uint32_t &out) {
+    if (!ntag_activate()) return TAG_NOT_PRESENT;
+
+    byte cmd[2] = {0x39, 0x02}; // READ_CNT, NFC counter (addr 2)
+    byte response[5];
+    byte responseLen = sizeof(response);
+    if (!ntag_transceive(cmd, 2, response, &responseLen) || responseLen < 3) {
+        mfrc522.PICC_HaltA();
+        return FAILURE;
+    }
+
+    out = (uint32_t)response[0] | ((uint32_t)response[1] << 8) | ((uint32_t)response[2] << 16);
+    mfrc522.PICC_HaltA();
+    return SUCCESS;
+}
+
+int RFID2::set_password(uint32_t pwd, uint16_t pack) {
+    byte cfg0;
+    if (!ntag_cfg0_page(cfg0)) return NOT_IMPLEMENTED;
+    if (!ntag_activate()) return TAG_NOT_PRESENT;
+
+    byte pwdBuf[4] = {(byte)(pwd >> 24), (byte)(pwd >> 16), (byte)(pwd >> 8), (byte)pwd};
+    byte packBuf[4] = {(byte)(pack >> 8), (byte)pack, 0x00, 0x00};
+
+    // PWD and PACK live at CFG0+2 and CFG0+3 on NTAG21x.
+    if (mfrc522.MIFARE_Ultralight_Write(cfg0 + 2, pwdBuf, 4) != MFRC522::StatusCode::STATUS_OK)
+        return FAILURE;
+    if (mfrc522.MIFARE_Ultralight_Write(cfg0 + 3, packBuf, 4) != MFRC522::StatusCode::STATUS_OK)
+        return FAILURE;
+
+    // Set AUTH0 (byte 3 of CFG0) = 0x00 so every page requires the password to write.
+    byte buffer[18];
+    byte size = sizeof(buffer);
+    if (mfrc522.MIFARE_Read(cfg0, buffer, &size) != MFRC522::StatusCode::STATUS_OK) return FAILURE;
+    byte cfg0Page[4] = {buffer[0], buffer[1], buffer[2], 0x00};
+    if (mfrc522.MIFARE_Ultralight_Write(cfg0, cfg0Page, 4) != MFRC522::StatusCode::STATUS_OK)
+        return FAILURE;
+
+    mfrc522.PICC_HaltA();
+    return SUCCESS;
+}
+
+int RFID2::remove_password(uint32_t pwd) {
+    byte cfg0;
+    if (!ntag_cfg0_page(cfg0)) return NOT_IMPLEMENTED;
+    if (!ntag_activate()) return TAG_NOT_PRESENT;
+
+    // Authenticate with the current password before touching the config pages.
+    byte cmd[5] = {0x1B, (byte)(pwd >> 24), (byte)(pwd >> 16), (byte)(pwd >> 8), (byte)pwd};
+    byte response[4];
+    byte responseLen = sizeof(response);
+    if (!ntag_transceive(cmd, 5, response, &responseLen)) {
+        mfrc522.PICC_HaltA();
+        return TAG_AUTH_ERROR;
+    }
+
+    // AUTH0 >= page count disables protection.
+    byte buffer[18];
+    byte size = sizeof(buffer);
+    if (mfrc522.MIFARE_Read(cfg0, buffer, &size) != MFRC522::StatusCode::STATUS_OK) return FAILURE;
+    byte cfg0Page[4] = {buffer[0], buffer[1], buffer[2], 0xFF};
+    if (mfrc522.MIFARE_Ultralight_Write(cfg0, cfg0Page, 4) != MFRC522::StatusCode::STATUS_OK)
+        return FAILURE;
+
+    mfrc522.PICC_HaltA();
+    return SUCCESS;
+}

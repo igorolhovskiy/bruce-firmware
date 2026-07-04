@@ -96,6 +96,12 @@ public:
     virtual int load() = 0;
     virtual int save(String filename) = 0;
 
+    // NTAG21x-specific operations (optional; default unimplemented).
+    virtual int read_signature(String &out) { return NOT_IMPLEMENTED; }
+    virtual int read_counter(uint32_t &out) { return NOT_IMPLEMENTED; }
+    virtual int set_password(uint32_t pwd, uint16_t pack) { return NOT_IMPLEMENTED; }
+    virtual int remove_password(uint32_t pwd) { return NOT_IMPLEMENTED; }
+
     String statusMessage(int status) const {
         switch (status) {
             case SUCCESS: return String(F("Success"));

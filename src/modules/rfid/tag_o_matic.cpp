@@ -233,6 +233,7 @@ void TagOMatic::loop() {
             case WRITE_MODE: write_data(); break;
             case WRITE_NDEF_MODE: write_ndef_data(); break;
             case EMULATE_MODE: emulate_card(); break;
+            case NTAG_TOOLS_MODE: ntag_tools(); break;
             case ERASE_MODE: erase_card(); break;
             case SAVE_MODE: save_file(); break;
         }
@@ -247,6 +248,8 @@ void TagOMatic::select_state() {
         options.emplace_back("Check tag", [this]() { set_state(CHECK_MODE); });
         options.emplace_back("Write data", [this]() { set_state(WRITE_MODE); });
         options.emplace_back("Emulate tag", [this]() { set_state(EMULATE_MODE); });
+        if (_rfid->printableUID.picc_type.indexOf("NTAG") >= 0)
+            options.emplace_back("NTAG tools", [this]() { set_state(NTAG_TOOLS_MODE); });
         options.emplace_back("Save file", [this]() { set_state(SAVE_MODE); });
     }
     options.emplace_back("Read tag", [this]() { set_state(READ_MODE); });
@@ -321,6 +324,7 @@ void TagOMatic::display_banner() {
         case WRITE_MODE: printSubtitle("WRITE DATA MODE"); break;
         case WRITE_NDEF_MODE: printSubtitle("WRITE NDEF MODE"); break;
         case EMULATE_MODE: printSubtitle("EMULATE MODE"); break;
+        case NTAG_TOOLS_MODE: printSubtitle("NTAG TOOLS"); break;
         case SAVE_MODE: printSubtitle("SAVE MODE"); break;
     }
 
@@ -533,6 +537,87 @@ void TagOMatic::erase_card() {
 
     delayWithReturn(1000);
     set_state(READ_MODE);
+}
+
+void TagOMatic::ntag_tools() {
+    options = {
+        {"Read signature", [this]() { ntag_read_signature(); }  },
+        {"Read counter",   [this]() { ntag_read_counter(); }    },
+        {"Set password",   [this]() { ntag_set_password(); }    },
+        {"Remove passwd",  [this]() { ntag_remove_password(); } },
+        {"Back",           [this]() { set_state(READ_MODE); }   },
+    };
+    loopOptions(options);
+    if (current_state == NTAG_TOOLS_MODE) set_state(READ_MODE);
+}
+
+void TagOMatic::ntag_read_signature() {
+    display_banner();
+    String sig;
+    int result = _rfid->read_signature(sig);
+    if (result != RFIDInterface::SUCCESS) {
+        displayError(_rfid->statusMessage(result), true);
+        return;
+    }
+    padprintln("ECC signature:");
+    for (int i = 0; i < (int)sig.length(); i += 32) padprintln(sig.substring(i, i + 32));
+    padprintln("");
+    padprintln("Press [OK] to continue.");
+    while (!check(SelPress) && !check(EscPress)) delay(30);
+}
+
+void TagOMatic::ntag_read_counter() {
+    display_banner();
+    uint32_t counter = 0;
+    int result = _rfid->read_counter(counter);
+    if (result != RFIDInterface::SUCCESS) {
+        displayError("Counter unavailable.", true);
+        return;
+    }
+    displaySuccess("NFC counter: " + String(counter), true);
+}
+
+void TagOMatic::ntag_set_password() {
+    String pwdStr = keyboard("FFFFFFFF", 8, "Password (8 hex):");
+    if (pwdStr == "\x1B") return;
+    String packStr = keyboard("0000", 4, "PACK (4 hex):");
+    if (packStr == "\x1B") return;
+
+    pwdStr.trim();
+    pwdStr.replace(" ", "");
+    packStr.trim();
+    packStr.replace(" ", "");
+
+    display_banner();
+    if (pwdStr.length() != 8 || packStr.length() != 4) {
+        displayError("Invalid PWD/PACK.", true);
+        return;
+    }
+
+    uint32_t pwd = strtoul(pwdStr.c_str(), NULL, 16);
+    uint16_t pack = (uint16_t)strtoul(packStr.c_str(), NULL, 16);
+
+    int result = _rfid->set_password(pwd, pack);
+    if (result == RFIDInterface::SUCCESS) displaySuccess("Password set. Keep it safe!", true);
+    else displayError(_rfid->statusMessage(result), true);
+}
+
+void TagOMatic::ntag_remove_password() {
+    String pwdStr = keyboard("FFFFFFFF", 8, "Current PWD (8 hex):");
+    if (pwdStr == "\x1B") return;
+    pwdStr.trim();
+    pwdStr.replace(" ", "");
+
+    display_banner();
+    if (pwdStr.length() != 8) {
+        displayError("Invalid PWD.", true);
+        return;
+    }
+
+    uint32_t pwd = strtoul(pwdStr.c_str(), NULL, 16);
+    int result = _rfid->remove_password(pwd);
+    if (result == RFIDInterface::SUCCESS) displaySuccess("Protection removed.", true);
+    else displayError(_rfid->statusMessage(result), true);
 }
 
 void TagOMatic::write_data() {
