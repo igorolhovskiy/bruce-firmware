@@ -41,6 +41,10 @@ Features developed in this fork, on top of stock Bruce. Each is T-Deck Plus only
 - **LED name badge BLE sender** — send text to 44×11 LSLED/VBLAB LED badges over BLE
   (BadgeMagic protocol), from the BLE menu.
 - **Hardware enablement** — microphone via the ES7210 codec, speaker over I2S, and GPS clock sync.
+- **Input tuning** — the trackball accumulates pulses and only advances one step past a
+  configurable sensitivity threshold (with debounce), so light nudges no longer over-scroll, and
+  the capacitive touchscreen can be turned off to stop accidental grip presses. Both live under
+  **Config → System Config** (`Trackball Sens.` and `Touch`) and persist across reboots.
 
 ## :building_construction: Building & flashing
 

@@ -172,6 +172,16 @@ void ConfigMenu::systemMenu() {
             {"Hide/Show Apps",                                                      [this]() { mainMenu.hideAppsMenu(); }},
             {"Clock",                                                               [this]() { setClock(); }             },
             {String("Keyboard Language: ") + bruceConfig.keyboardLang,              [this]() { setKeyboardLanguage(); }  },
+#if defined(T_DECK_PLUS) || defined(NORMAL_T_DECK)
+            {String("Trackball Sens.: ") + String(bruceConfig.trackballSensitivity),
+                                                                                    [this]() { setTrackballSensitivityMenu(); }},
+#endif
+#if defined(HAS_TOUCH)
+            {String("Touch: ") + (bruceConfig.touchEnabled ? "ON" : "OFF"),
+             [this]() {
+                 bruceConfig.setTouchEnabled(!bruceConfig.touchEnabled);
+             }                                                                                                              },
+#endif
             {"Advanced",                                                            [this]() { advancedMenu(); }         },
             {"Back",                                                                []() {}                              },
         };

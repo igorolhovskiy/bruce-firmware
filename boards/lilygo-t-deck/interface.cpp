@@ -17,25 +17,30 @@ void IRAM_ATTR ISR_left();
 void IRAM_ATTR ISR_right();
 
 bool trackball_interrupted = false;
-int8_t trackball_up_count = 0;
-int8_t trackball_down_count = 0;
-int8_t trackball_left_count = 0;
-int8_t trackball_right_count = 0;
+// Accumulated pulse counts per direction. The trackball emits a burst of pulses per
+// physical roll, so we count them and only emit a navigation step once the total on an
+// axis crosses bruceConfig.trackballSensitivity (see InputHandler). Capped to avoid
+// wrap-around if the ball is spun hard.
+volatile int16_t trackball_up_count = 0;
+volatile int16_t trackball_down_count = 0;
+volatile int16_t trackball_left_count = 0;
+volatile int16_t trackball_right_count = 0;
+#define TRACKBALL_MAX_COUNT 1000
 void IRAM_ATTR ISR_up() {
     trackball_interrupted = true;
-    trackball_up_count = 1;
+    if (trackball_up_count < TRACKBALL_MAX_COUNT) trackball_up_count++;
 }
 void IRAM_ATTR ISR_down() {
     trackball_interrupted = true;
-    trackball_down_count = 1;
+    if (trackball_down_count < TRACKBALL_MAX_COUNT) trackball_down_count++;
 }
 void IRAM_ATTR ISR_left() {
     trackball_interrupted = true;
-    trackball_left_count = 1;
+    if (trackball_left_count < TRACKBALL_MAX_COUNT) trackball_left_count++;
 }
 void IRAM_ATTR ISR_right() {
     trackball_interrupted = true;
-    trackball_right_count = 1;
+    if (trackball_right_count < TRACKBALL_MAX_COUNT) trackball_right_count++;
 }
 
 void ISR_rst() {
@@ -169,7 +174,7 @@ void InputHandler(void) {
         }
         rot = bruceConfigPins.rotation;
     }
-    touched = touch.getPoint(&t.x, &t.y);
+    if (bruceConfig.touchEnabled) touched = touch.getPoint(&t.x, &t.y);
     delay(1);
     Wire.requestFrom(LILYGO_KB_SLAVE_ADDRESS, 1);
     while (Wire.available() > 0) {
@@ -178,34 +183,49 @@ void InputHandler(void) {
     }
     if (millis() - tm < 200 && !LongPress) return;
 
-    // 0 - UP
-    // 1 - Down
-    // 2 - Left
-    // 3 - Right
+    // Trackball: up/left roll one way (Prev), down/right the other (Next). A single physical
+    // roll emits several pulses; we only advance one step once the pulses on a direction reach
+    // the configured sensitivity threshold, then debounce so one flick can't machine-gun.
+#define TRACKBALL_DEBOUNCE_MS 90 // min gap between emitted steps
+#define TRACKBALL_STALE_MS 250   // discard sub-threshold pulses after this idle time
     if (trackball_interrupted) {
-        uint8_t xx = 1;
-        uint8_t yy = 1;
-        xx += trackball_left_count;
-        xx -= trackball_right_count;
-        yy -= trackball_up_count;
-        yy += trackball_down_count;
-        if (xx == 1 && yy == 1) {
-            ISR_rst();
-        } else {
-            if (!wakeUpScreen()) AnyKeyPress = true;
-            else return;
+        static unsigned long lastTrackballStep = 0;
+        static unsigned long trackballChangedAt = 0;
+        static int lastTotal = 0;
+
+        int threshold = bruceConfig.trackballSensitivity;
+        if (threshold < 1) threshold = 1;
+
+        int prevPulses = trackball_up_count + trackball_left_count;    // up / left
+        int nextPulses = trackball_down_count + trackball_right_count; // down / right
+        int total = prevPulses + nextPulses;
+        unsigned long now = millis();
+
+        if (total != lastTotal) {
+            trackballChangedAt = now;
+            lastTotal = total;
         }
-        delay(50);
-        // Print "bot - xx - yy",  1 is normal value for xx and yy 0 and 2 means movement on the axis
-        // Serial.print(bot); Serial.print("-"); Serial.print(xx); Serial.print("-"); Serial.println(yy);
-        if (xx < 1 || yy < 1) {
+
+        if (prevPulses >= threshold || nextPulses >= threshold) {
+            if (now - lastTrackballStep >= TRACKBALL_DEBOUNCE_MS) {
+                if (!wakeUpScreen()) {
+                    AnyKeyPress = true;
+                    if (prevPulses >= nextPulses) PrevPress = true;
+                    else NextPress = true;
+                    lastTrackballStep = now;
+                } else {
+                    ISR_rst();
+                    lastTotal = 0;
+                    return;
+                }
+            }
             ISR_rst();
-            PrevPress = true;
-        } // left , Up
-        else if (xx > 1 || yy > 1) {
+            lastTotal = 0;
+        } else if (now - trackballChangedAt > TRACKBALL_STALE_MS) {
+            // A nudge too small to cross the threshold; drop it so it can't accumulate later.
             ISR_rst();
-            NextPress = true;
-        } // right, Down
+            lastTotal = 0;
+        }
     }
 
     if (keyValue != (char)0x00) {
