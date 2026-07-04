@@ -24,6 +24,7 @@ public:
         WRITE_NDEF_MODE,
         EMULATE_MODE,
         NTAG_TOOLS_MODE,
+        LOG_MODE,
         ERASE_MODE,
         LOAD_MODE,
         SAVE_MODE
@@ -67,6 +68,8 @@ private:
     std::vector<String> _scanned_tags;
     String _sourceUID;
     String _sourcePages;
+    String _logFile;
+    String _logShortName;
 
     /////////////////////////////////////////////////////////////////////////////////////
     // Display functions
@@ -89,6 +92,9 @@ private:
     /////////////////////////////////////////////////////////////////////////////////////
     void read_card();
     void scan_cards();
+    void log_uids();
+    void init_uid_log();
+    void append_uid_log(const String &uid, const String &type);
     void check_card();
     void write_custom_uid();
     void clone_card();

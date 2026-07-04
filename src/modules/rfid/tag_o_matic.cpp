@@ -234,6 +234,7 @@ void TagOMatic::loop() {
             case WRITE_NDEF_MODE: write_ndef_data(); break;
             case EMULATE_MODE: emulate_card(); break;
             case NTAG_TOOLS_MODE: ntag_tools(); break;
+            case LOG_MODE: log_uids(); break;
             case ERASE_MODE: erase_card(); break;
             case SAVE_MODE: save_file(); break;
         }
@@ -254,6 +255,7 @@ void TagOMatic::select_state() {
     }
     options.emplace_back("Read tag", [this]() { set_state(READ_MODE); });
     options.emplace_back("Scan tags", [this]() { set_state(SCAN_MODE); });
+    options.emplace_back("UID logger", [this]() { set_state(LOG_MODE); });
     options.emplace_back("Load file", [this]() { set_state(LOAD_MODE); });
     options.emplace_back("Write NDEF", [this]() { set_state(WRITE_NDEF_MODE); });
     options.emplace_back("Erase tag", [this]() { set_state(ERASE_MODE); });
@@ -278,6 +280,11 @@ void TagOMatic::set_state(RFID_State state) {
         case SCAN_MODE:
             _scanned_set.clear();
             _scanned_tags.clear();
+            break;
+        case LOG_MODE:
+            _scanned_set.clear();
+            _scanned_tags.clear();
+            init_uid_log();
             break;
         case CHECK_MODE:
             _sourceUID = _rfid->printableUID.uid;
@@ -325,6 +332,7 @@ void TagOMatic::display_banner() {
         case WRITE_NDEF_MODE: printSubtitle("WRITE NDEF MODE"); break;
         case EMULATE_MODE: printSubtitle("EMULATE MODE"); break;
         case NTAG_TOOLS_MODE: printSubtitle("NTAG TOOLS"); break;
+        case LOG_MODE: printSubtitle("UID LOGGER"); break;
         case SAVE_MODE: printSubtitle("SAVE MODE"); break;
     }
 
@@ -440,6 +448,60 @@ void TagOMatic::scan_cards() {
     }
 
     display_banner();
+    dump_scan_results();
+
+    delayWithReturn(200);
+}
+
+void TagOMatic::init_uid_log() {
+    _logFile = "";
+    _logShortName = "";
+
+    FS *fs;
+    if (!getFsStorage(fs)) return;
+    if (!(*fs).exists("/BruceRFID")) (*fs).mkdir("/BruceRFID");
+    if (!(*fs).exists("/BruceRFID/Logs")) (*fs).mkdir("/BruceRFID/Logs");
+
+    String name = "uidlog";
+    int i = 1;
+    while ((*fs).exists("/BruceRFID/Logs/" + name + ".csv")) name = "uidlog_" + String(i++);
+
+    _logFile = "/BruceRFID/Logs/" + name + ".csv";
+    _logShortName = name + ".csv";
+
+    File file = (*fs).open(_logFile, FILE_WRITE);
+    if (file) {
+        file.println("ms_since_boot,uid,type");
+        file.close();
+    }
+}
+
+void TagOMatic::append_uid_log(const String &uid, const String &type) {
+    if (_logFile == "") return;
+
+    FS *fs;
+    if (!getFsStorage(fs)) return;
+
+    File file = (*fs).open(_logFile, FILE_APPEND);
+    if (!file) return;
+    file.println(String(millis()) + "," + uid + "," + type);
+    file.close();
+}
+
+void TagOMatic::log_uids() {
+    if (_rfid->read() != RFIDInterface::SUCCESS) return;
+
+    String uid = _rfid->printableUID.uid;
+    if (_scanned_set.find(uid) == _scanned_set.end()) {
+        _scanned_set.insert(uid);
+        _scanned_tags.push_back(uid);
+        append_uid_log(uid, _rfid->printableUID.picc_type);
+    }
+
+    display_banner();
+    padprintln("Logged: " + String((int)_scanned_tags.size()) + " unique");
+    padprintln("File: " + (_logShortName == "" ? String("(no SD)") : _logShortName));
+    padprintln("");
     dump_scan_results();
 
     delayWithReturn(200);
