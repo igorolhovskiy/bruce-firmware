@@ -13,9 +13,157 @@
 
 #include "PN532.h"
 #include "RFID2.h"
+#include <vector>
 
 #define NDEF_DATA_SIZE 100
 #define SCAN_DUMP_SIZE 5
+
+namespace {
+// Flatten a "Page N: XX XX XX XX" dump (as produced by the RFID read path) into raw bytes.
+std::vector<uint8_t> ndef_pages_to_bytes(const String &allPages) {
+    std::vector<uint8_t> bytes;
+    int idx = 0;
+    while (idx < (int)allPages.length()) {
+        int nl = allPages.indexOf('\n', idx);
+        String line = (nl < 0) ? allPages.substring(idx) : allPages.substring(idx, nl);
+        int colon = line.indexOf(':');
+        if (line.startsWith("Page ") && colon > 0) {
+            String hex = line.substring(colon + 1);
+            hex.trim();
+            int p = 0;
+            while (p < (int)hex.length()) {
+                while (p < (int)hex.length() && hex[p] == ' ') p++;
+                if (p + 1 < (int)hex.length() || (p < (int)hex.length() && hex.length() - p >= 2)) {
+                    if (p + 2 <= (int)hex.length()) {
+                        bytes.push_back((uint8_t)strtoul(hex.substring(p, p + 2).c_str(), NULL, 16));
+                    }
+                    p += 2;
+                } else break;
+            }
+        }
+        if (nl < 0) break;
+        idx = nl + 1;
+    }
+    return bytes;
+}
+
+// NFC Forum URI record prefix abbreviation table (NFC RTD URI, section 3.2.2).
+const char *const kUriPrefixes[] = {
+    "",         "http://www.",  "https://www.", "http://",      "https://",   "tel:",
+    "mailto:",  "ftp://anonymous:anonymous@", "ftp://ftp.",     "ftps://",    "sftp://",
+    "smb://",   "nfs://",       "ftp://",       "dav://",       "news:",      "telnet://",
+    "imap:",    "rtsp://",      "urn:",         "pop:",         "sip:",       "sips:",
+    "tftp:",    "btspp://",     "btl2cap://",   "btgoep://",    "tcpobex://", "irdaobex://",
+    "file://",  "urn:epc:id:",  "urn:epc:tag:", "urn:epc:pat:", "urn:epc:raw:", "urn:epc:",
+    "urn:nfc:"
+};
+
+String ndef_ascii(const std::vector<uint8_t> &data, size_t start, size_t len) {
+    String out = "";
+    for (size_t i = start; i < start + len && i < data.size(); i++) {
+        char c = (char)data[i];
+        out += (c >= 0x20 && c < 0x7F) ? c : '.';
+    }
+    return out;
+}
+
+// Parse an NDEF message (record stream) into human-readable lines.
+std::vector<String> ndef_parse_message(const std::vector<uint8_t> &msg) {
+    std::vector<String> lines;
+    size_t i = 0;
+    while (i < msg.size()) {
+        uint8_t hdr = msg[i++];
+        bool sr = hdr & 0x10; // short record
+        bool il = hdr & 0x08; // id length present
+        uint8_t tnf = hdr & 0x07;
+
+        if (i >= msg.size()) break;
+        uint8_t typeLen = msg[i++];
+
+        uint32_t payloadLen;
+        if (sr) {
+            if (i >= msg.size()) break;
+            payloadLen = msg[i++];
+        } else {
+            if (i + 4 > msg.size()) break;
+            payloadLen = ((uint32_t)msg[i] << 24) | ((uint32_t)msg[i + 1] << 16) |
+                         ((uint32_t)msg[i + 2] << 8) | msg[i + 3];
+            i += 4;
+        }
+
+        uint8_t idLen = 0;
+        if (il) {
+            if (i >= msg.size()) break;
+            idLen = msg[i++];
+        }
+
+        String type = ndef_ascii(msg, i, typeLen);
+        i += typeLen;
+        i += idLen; // skip ID
+        size_t payloadStart = i;
+        i += payloadLen;
+        if (payloadStart > msg.size()) break;
+
+        if (tnf == 0x01 && type == "U") { // Well-known URI
+            uint8_t code = payloadStart < msg.size() ? msg[payloadStart] : 0;
+            String uri = (code < (sizeof(kUriPrefixes) / sizeof(kUriPrefixes[0]))) ? kUriPrefixes[code] : "";
+            uri += ndef_ascii(msg, payloadStart + 1, payloadLen > 0 ? payloadLen - 1 : 0);
+            lines.push_back("URI: " + uri);
+        } else if (tnf == 0x01 && type == "T") { // Well-known Text
+            uint8_t status = payloadStart < msg.size() ? msg[payloadStart] : 0;
+            uint8_t langLen = status & 0x3F;
+            lines.push_back("Text: " + ndef_ascii(msg, payloadStart + 1 + langLen,
+                                                   payloadLen > (1 + langLen) ? payloadLen - 1 - langLen : 0));
+        } else if (tnf == 0x02) { // MIME media
+            lines.push_back("MIME " + type);
+            String body = ndef_ascii(msg, payloadStart, payloadLen);
+            if (body.length() > 40) body = body.substring(0, 40) + "...";
+            lines.push_back("  " + body);
+        } else {
+            lines.push_back("Record TNF " + String(tnf) + (type.length() ? " " + type : ""));
+        }
+
+        if (hdr & 0x40) break; // ME (message end)
+    }
+    return lines;
+}
+
+// Locate the NDEF message TLV (0x03) in a Type-2 tag dump and return its decoded lines.
+std::vector<String> ndef_decode_type2(const std::vector<uint8_t> &bytes) {
+    std::vector<String> lines;
+    size_t i = 16; // user memory starts at page 4 (byte 16) on Ultralight/NTAG
+    while (i < bytes.size()) {
+        uint8_t t = bytes[i];
+        if (t == 0x00) {
+            i++;
+            continue;
+        } // NULL TLV
+        if (t == 0xFE) break; // Terminator TLV
+        if (i + 1 >= bytes.size()) break;
+
+        uint32_t len;
+        size_t hdrLen;
+        if (bytes[i + 1] == 0xFF) {
+            if (i + 3 >= bytes.size()) break;
+            len = ((uint32_t)bytes[i + 2] << 8) | bytes[i + 3];
+            hdrLen = 4;
+        } else {
+            len = bytes[i + 1];
+            hdrLen = 2;
+        }
+
+        if (t == 0x03) { // NDEF message TLV
+            size_t start = i + hdrLen;
+            size_t end = start + len;
+            if (end > bytes.size()) end = bytes.size();
+            std::vector<uint8_t> msg(bytes.begin() + start, bytes.begin() + end);
+            return ndef_parse_message(msg);
+        }
+        i += hdrLen + len; // skip lock/memory/proprietary TLVs
+    }
+    return lines;
+}
+} // namespace
 
 TagOMatic::TagOMatic() {
     _initial_state = READ_MODE;
@@ -199,6 +347,30 @@ void TagOMatic::dump_card_details() {
         padprintln("[!] " + _rfid->statusMessage(_rfid->pageReadStatus));
 }
 
+void TagOMatic::dump_ndef_records() {
+    String type = _rfid->printableUID.picc_type;
+    if (type.indexOf("Ultralight") < 0 && type.indexOf("NTAG") < 0) return;
+
+    std::vector<uint8_t> bytes = ndef_pages_to_bytes(_rfid->strAllPages);
+    if (bytes.size() < 20) return;
+
+    std::vector<String> lines = ndef_decode_type2(bytes);
+    if (lines.empty()) return;
+
+    padprintln("");
+    padprintln("NDEF:");
+    int shown = 0;
+    for (auto &line : lines) {
+        if (shown++ >= 4) {
+            padprintln("  ...");
+            break;
+        }
+        String l = line;
+        if (l.length() > 34) l = l.substring(0, 34) + "..";
+        padprintln("  " + l);
+    }
+}
+
 void TagOMatic::dump_check_details() {
     padprintln("Source UID: " + _sourceUID);
     padprintln("");
@@ -247,6 +419,7 @@ void TagOMatic::read_card() {
 
     display_banner();
     dump_card_details();
+    dump_ndef_records();
 
     _read_uid = true;
     _lastReadTime = millis();

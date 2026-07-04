@@ -105,6 +105,9 @@ private:
     void create_ndef_message();
     void create_ndef_url();
     void create_ndef_text();
+
+    // Decode NDEF records from the last read page dump (Ultralight/NTAG) and print them.
+    void dump_ndef_records();
 };
 
 #endif
