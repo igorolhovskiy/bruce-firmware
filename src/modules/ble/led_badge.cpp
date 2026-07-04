@@ -189,37 +189,43 @@ bool sendBadgePacket(const std::vector<uint8_t> &packet) {
     scan->setInterval(100);
     scan->setWindow(99);
 
-    displayTextLine("Scanning badge...");
-    Serial.println("[LEDBadge] Scanning for badge (fee0/fff0)...");
-
-#ifdef NIMBLE_V2_PLUS
-    NimBLEScanResults results = scan->getResults(5 * 1000, false);
-#else
-    NimBLEScanResults results = scan->start(5, false);
-#endif
-
+    // The badge advertises strongly while in "bt wait", but only weakly/
+    // intermittently once it is displaying a message. Retry the scan a few
+    // times so a marginal advertiser is still caught.
     NimBLEAddress addr;
     bool found = false;
-    for (int i = 0; i < results.getCount() && !found; ++i) {
+    const int kScanAttempts = 4;
+    for (int attempt = 0; attempt < kScanAttempts && !found; ++attempt) {
+        displayTextLine("Scanning badge " + String(attempt + 1) + "/" + String(kScanAttempts));
+        Serial.printf("[LEDBadge] Scan attempt %d/%d (fee0/fff0)...\n", attempt + 1, kScanAttempts);
+        if (check(EscPress)) break;
+
 #ifdef NIMBLE_V2_PLUS
-        const NimBLEAdvertisedDevice *adv = results.getDevice(i);
-        String name = String(adv->getName().c_str());
-        bool match = adv->isAdvertisingService(SVC_LSLED) || adv->isAdvertisingService(SVC_VBLAB);
-        NimBLEAddress a = adv->getAddress();
+        NimBLEScanResults results = scan->getResults(5 * 1000, false);
 #else
-        NimBLEAdvertisedDevice adv = results.getDevice(i);
-        String name = String(adv.getName().c_str());
-        bool match = adv.isAdvertisingService(SVC_LSLED) || adv.isAdvertisingService(SVC_VBLAB);
-        NimBLEAddress a = adv.getAddress();
+        NimBLEScanResults results = scan->start(5, false);
 #endif
-        name.toUpperCase();
-        if (match || name.indexOf("LSLED") >= 0 || name.indexOf("LS32") >= 0) {
-            addr = a;
-            found = true;
+        for (int i = 0; i < results.getCount() && !found; ++i) {
+#ifdef NIMBLE_V2_PLUS
+            const NimBLEAdvertisedDevice *adv = results.getDevice(i);
+            String name = String(adv->getName().c_str());
+            bool match = adv->isAdvertisingService(SVC_LSLED) || adv->isAdvertisingService(SVC_VBLAB);
+            NimBLEAddress a = adv->getAddress();
+#else
+            NimBLEAdvertisedDevice adv = results.getDevice(i);
+            String name = String(adv.getName().c_str());
+            bool match = adv.isAdvertisingService(SVC_LSLED) || adv.isAdvertisingService(SVC_VBLAB);
+            NimBLEAddress a = adv.getAddress();
+#endif
+            name.toUpperCase();
+            if (match || name.indexOf("LSLED") >= 0 || name.indexOf("LS32") >= 0) {
+                addr = a;
+                found = true;
+            }
         }
+        scan->stop();
+        scan->clearResults();
     }
-    scan->stop();
-    scan->clearResults();
 
     if (!found) {
         Serial.println("[LEDBadge] No badge found.");
