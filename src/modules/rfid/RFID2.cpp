@@ -104,6 +104,22 @@ bool RFID2::PICC_IsNewCardPresent() {
     return bl_result;
 }
 
+bool RFID2::reselect_card() {
+    // A failed MIFARE Classic authentication leaves the reader's Crypto1 unit engaged
+    // and drops the card into the HALT state. REQA (PICC_RequestA) is ignored by halted
+    // cards, so clear Crypto1 and wake it with WUPA (PICC_WakeupA), which answers from
+    // both idle and halted states, then re-run anticollision + select.
+    mfrc522.PCD_StopCrypto1();
+
+    byte atqa[2];
+    byte atqaSize = sizeof(atqa);
+    MFRC522::StatusCode status = mfrc522.PICC_WakeupA(atqa, &atqaSize);
+    if (status != MFRC522::StatusCode::STATUS_OK && status != MFRC522::StatusCode::STATUS_COLLISION)
+        return false; // card removed -> abort the grind
+
+    return mfrc522.PICC_ReadCardSerial();
+}
+
 int RFID2::read(int cardBaudRate) {
     pageReadStatus = FAILURE;
 
@@ -438,7 +454,7 @@ int RFID2::authenticate_mifare_classic(byte block) {
         );
         if (statusA == MFRC522::StatusCode::STATUS_OK) break;
 
-        if (!PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) { return TAG_NOT_PRESENT; }
+        if (!reselect_card()) return TAG_NOT_PRESENT;
     }
 
     if (statusA != MFRC522::StatusCode::STATUS_OK) {
@@ -452,7 +468,7 @@ int RFID2::authenticate_mifare_classic(byte block) {
             );
             if (statusA == MFRC522::StatusCode::STATUS_OK) break;
 
-            if (!PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) { return TAG_NOT_PRESENT; }
+            if (!reselect_card()) return TAG_NOT_PRESENT;
         }
     }
 
@@ -466,7 +482,7 @@ int RFID2::authenticate_mifare_classic(byte block) {
             );
             if (statusA == MFRC522::StatusCode::STATUS_OK) break;
 
-            if (!PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) { return TAG_NOT_PRESENT; }
+            if (!reselect_card()) return TAG_NOT_PRESENT;
         }
     }
 
@@ -478,7 +494,7 @@ int RFID2::authenticate_mifare_classic(byte block) {
         );
         if (statusB == MFRC522::StatusCode::STATUS_OK) break;
 
-        if (!PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) { return TAG_NOT_PRESENT; }
+        if (!reselect_card()) return TAG_NOT_PRESENT;
     }
 
     if (statusB != MFRC522::StatusCode::STATUS_OK) {
@@ -492,7 +508,7 @@ int RFID2::authenticate_mifare_classic(byte block) {
             );
             if (statusB == MFRC522::StatusCode::STATUS_OK) break;
 
-            if (!PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) { return TAG_NOT_PRESENT; }
+            if (!reselect_card()) return TAG_NOT_PRESENT;
         }
     }
 
@@ -506,7 +522,7 @@ int RFID2::authenticate_mifare_classic(byte block) {
             );
             if (statusB == MFRC522::StatusCode::STATUS_OK) break;
 
-            if (!PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) { return TAG_NOT_PRESENT; }
+            if (!reselect_card()) return TAG_NOT_PRESENT;
         }
     }
 

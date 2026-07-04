@@ -75,6 +75,10 @@ private:
     /////////////////////////////////////////////////////////////////////////////////////
     bool PICC_IsNewCardPresent();
 
+    // Re-select the card between dictionary key tries. A failed Classic auth leaves the
+    // Crypto1 unit engaged and halts the card, so REQA can't find it again — WUPA can.
+    bool reselect_card();
+
     String get_tag_type();
     int read_data_blocks();
     int read_mifare_classic_data_blocks(byte piccType);
