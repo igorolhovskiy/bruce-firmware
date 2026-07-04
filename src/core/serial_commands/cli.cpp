@@ -1,5 +1,6 @@
 #include "cli.h"
 #include "badusb_commands.h"
+#include "ble_commands.h"
 #include "core/sd_functions.h"
 #include "crypto_commands.h"
 #include "gpio_commands.h"
@@ -48,6 +49,7 @@ void SerialCli::setup() {
 #endif
 #ifndef LITE_VERSION
     createInterpreterCommands(&_cli);
+    createBleCommands(&_cli);
 #endif
 #ifdef HAS_SCREEN
     createScreenCommands(&_cli);

@@ -6,6 +6,9 @@
 #include "modules/ble/ble_ninebot.h"
 #include "modules/ble/ble_spam.h"
 #if !defined(LITE_VERSION)
+#include "modules/ble/led_badge.h"
+#endif
+#if !defined(LITE_VERSION)
 #include "modules/ble/BLE_Suite.h"
 #endif
 #include <globals.h>
@@ -41,6 +44,7 @@ void BleMenu::optionsMenu() {
 #if !defined(LITE_VERSION)
     options.push_back({"BLE Suite", [=]() { BleSuiteMenu(); }});
     options.push_back({"Ninebot", [=]() { BLENinebot(); }});
+    options.push_back({"LED Badge", [=]() { ledBadgeMenu(); }});
 #endif
     addOptionToMainMenu();
 
