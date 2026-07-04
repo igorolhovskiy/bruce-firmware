@@ -1,42 +1,64 @@
 ![Bruce Main Menu](./media/pictures/bruce_banner.jpg)
 
-# :shark: Bruce
+# :shark: Bruce — T-Deck Plus fork
 
-Bruce is a versatile ESP32 firmware that supports a ton of offensive features focusing on facilitating Red Team operations.
-This fork is focused ONLY on T-Deck Plus + some extensions. All extra stuff is FULLY VIBECODED.
+Bruce is a versatile ESP32 firmware that supports a ton of offensive features focusing on
+facilitating Red Team operations.
 
-**Check our fully open-source hardware too:** https://bruce.computer/boards
+**This is a personal fork focused ONLY on the [LilyGo T-Deck Plus](https://lilygo.cc/products/t-deck-plus-1)**
+(ESP32-S3, 2.8" ST7789 320×240, trackball + QWERTY keyboard, WiFi + LoRa). It tracks upstream
+[Bruce](https://github.com/pr3y/Bruce) and adds a handful of T-Deck-specific features and hardware
+enablements. **All fork-specific extras are FULLY VIBECODED** — use at your own risk.
 
-**Also Check Our official Shop!! Buy here and support us** https://bruce-devices.myshopify.com/
+For everything about stock Bruce (other boards, the full feature set, the web flasher, the shop),
+see the upstream project: <https://github.com/pr3y/Bruce> and the [wiki](https://wiki.bruce.computer/).
 
-## :building_construction: How to install
+### From the original Bruce project
 
-### The easiest way to install Bruce is using our official Web Flasher!
+**Check their fully open-source hardware too:** https://bruce.computer/boards
 
-### Check out: https://bruce.computer/flasher
+**Also check the official Shop!! Buy here and support them:** https://bruce-devices.myshopify.com/
 
-Alternatively, you can download the latest binary from releases or actions and flash locally using esptool.py
+**Discord:** contact the Bruce community in their [Discord Server](https://discord.gg/WJ9XF9czVT)!
+
+## :sparkles: What this fork adds
+
+Features developed in this fork, on top of stock Bruce. Each is T-Deck Plus only unless noted.
+
+- **[WiFi Analyzer](./docs/wifi-analyzer-README.md)** — passive 2.4 GHz signal-strength bar graph
+  with async scanning and channel/AP highlighting (receive-only).
+- **[LoRa Recon](./docs/lora-recon-README.md)** — passive, receive-only LoRa/LoRaWAN
+  reconnaissance (EU868): channel/SF sweep, human-readable frame decode, replay/FCnt anomaly hints.
+- **[Meshtastic LF](./docs/meshtastic-README.md)** — two-way Meshtastic text client on the default
+  LongFast channel (EU868): receive/decrypt/display and compose/encrypt/send text, heard-nodes
+  list, duty-cycle limited. Interoperates with stock Meshtastic (default key).
+- **IR via M5Stack Unit IR** — full Bruce IR (TV-B-Gone, receiver, custom IR) over the T-Deck Plus
+  Grove port (GPIO43/44) using an external M5Stack Unit IR.
+- **RFID2 extensions** — for the M5Stack RFID2 (PN532) on the Grove port: load a MIFARE key
+  dictionary from SD, decode/display NDEF records, NTAG21x tools (signature, counter, password),
+  a continuous UID logger (recon mode), and gen2/CUID magic-card clone with unbrick. The Grove I2C
+  bus is routed to `Wire1` so the reader no longer conflicts with the keyboard on the shared bus.
+- **LED name badge BLE sender** — send text to 44×11 LSLED/VBLAB LED badges over BLE
+  (BadgeMagic protocol), from the BLE menu.
+- **Hardware enablement** — microphone via the ES7210 codec, speaker over I2S, and GPS clock sync.
+
+## :building_construction: Building & flashing
+
+The T-Deck Plus target env is **`lilygo-t-deck-pro`** (despite the name — see the comment in
+`boards/lilygo-t-deck/lilygo-t-deck.ini`).
 
 ```sh
-esptool.py --port /dev/ttyACM0 write_flash 0x00000 Bruce-<device>.bin
+pio run -e lilygo-t-deck-pro                 # compile
+pio run -e lilygo-t-deck-pro -t upload       # compile + flash over USB (/dev/ttyACM0)
+pio device monitor -b 115200                 # serial monitor
 ```
 
-**For m5stack devices**
+If upload fails: hold the trackball centre (BOOT), plug in USB, start the upload, press RST after.
 
-If you already use M5Launcher to manage your m5stack device, you can install it with OTA
+## :computer: Stock Bruce features
 
-Or you can burn it directly from the [m5burner tool](https://docs.m5stack.com/en/download), just search for 'Bruce' (My official builds will be uploaded by "owner" and have photos.) on the device category you want to and click on burn
-
-## :keyboard: Discord Server
-
-Contact us in our [Discord Server](https://discord.gg/WJ9XF9czVT)!
-
-## :bookmark_tabs: Wiki
-
-For more information on each function supported by Bruce, [read our wiki here](https://wiki.bruce.computer/).
-Also, [read our FAQ](https://wiki.bruce.computer/faq/)
-
-## :computer: List of Features
+These are inherited from upstream Bruce and available on the T-Deck Plus. See the
+[wiki](https://wiki.bruce.computer/) for details on each.
 
 <details>
   <summary><h2>WiFi</h2></summary>
@@ -76,7 +98,7 @@ Also, [read our FAQ](https://wiki.bruce.computer/faq/)
 
 - [x] [BLE Scan](https://wiki.bruce.computer/features/ble/#ble-scan)
 - [x] Bad BLE - Run Ducky scripts, similar to [BadUsb](https://wiki.bruce.computer/features/ble/#badble)
-- [x] BLE Keyboard - Cardputer and T-Deck Only
+- [x] BLE Keyboard
 - [x] iOS Spam
 - [x] Windows Spam
 - [x] Samsung Spam
@@ -120,6 +142,9 @@ Also, [read our FAQ](https://wiki.bruce.computer/faq/)
     - [x] PN532
     - [x] PN532Killer
 - [ ] Emulate tag
+
+> See **RFID2 extensions** under "What this fork adds" above for the fork's added
+> M5Stack RFID2 features.
 </details>
 
 <details>
@@ -129,6 +154,9 @@ Also, [read our FAQ](https://wiki.bruce.computer/faq/)
 - [x] IR Receiver
 - [x] [Custom IR (NEC, NECext, SIRC, SIRC15, SIRC20, Samsung32, RC5, RC5X, RC6)](https://wiki.bruce.computer/features/ir/#replay-payloads-like-flipper)
 - [x] Config - [X] Ir TX Pin - [X] Ir RX Pin
+
+> On the T-Deck Plus, IR runs over an external M5Stack Unit IR on the Grove port — see
+> "What this fork adds" above.
 </details>
 
 <details>
@@ -154,12 +182,8 @@ Also, [read our FAQ](https://wiki.bruce.computer/faq/)
   <summary><h2>LoRa</h2></summary>
 
 - [x] Chat (Bruce-to-Bruce)
-- [x] [LoRa Recon](./docs/lora-recon-README.md) - passive, receive-only LoRa/LoRaWAN
-  reconnaissance (EU868): channel/SF sweep, human-readable frame decode, replay/FCnt anomaly
-  hints. T-Deck Plus only for now.
-- [x] [Meshtastic LF](./docs/meshtastic-README.md) - two-way Meshtastic text client on the default
-  LongFast channel (EU868): receive/decrypt/display and compose/encrypt/send text, heard-nodes list,
-  duty-cycle limited. Interoperates with stock Meshtastic (default key). T-Deck Plus only for now.
+- [x] [LoRa Recon](./docs/lora-recon-README.md) — fork feature (see above)
+- [x] [Meshtastic LF](./docs/meshtastic-README.md) — fork feature (see above)
 </details>
 
 <details>
@@ -189,7 +213,7 @@ Also, [read our FAQ](https://wiki.bruce.computer/faq/)
   - [x] Spiffs Mngr
 - [x] Megalodon
 - [x] [BADUsb (New features, LittleFS and SDCard)](https://wiki.bruce.computer/features/others/#badusb)
-- [x] USB Keyboard - Cardputer and T-Deck Only
+- [x] USB Keyboard
 - [x] [iButton](https://wiki.bruce.computer/features/others/#ibutton)
 - [x] LED Control
 </details>
@@ -224,56 +248,13 @@ Also, [read our FAQ](https://wiki.bruce.computer/faq/)
 - [x] Restart
 </details>
 
-## Specific functions per Device, the ones not mentioned here are available to all.
-
-| Device                                                                                                                                                                                      | CC1101 | NRF24 | FM Radio |        PN532         | Mic  | BadUSB | RGB Led | Speaker | Fuel Guage | LITE_VERSION |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----: | :---: | :------: | :------------------: | :--: | :----: | :-----: | :-----: | :--------: | :----------: |
-| [M5Stack Cardputer](https://shop.m5stack.com/products/m5stack-cardputer-kit-w-m5stamps) (and ADV)                                                                                           |  :ok:  | :ok:  |   :ok:   |         :ok:         | :ok: |  :ok:  |  :ok:   | NS4168  |    :x:     |     :x:      |
-| [M5Stack M5StickC PLUS2](https://shop.m5stack.com/products/m5stickc-plus2-esp32-mini-iot-development-kit)                                                                                   |  :ok:  | :ok:  |   :ok:   |         :ok:         | :ok: | :ok:¹  |   :x:   |  Tone   |    :x:     |     :x:      |
-| [M5Stack M5StickC PLUS](https://shop.m5stack.com/products/m5stickc-plus-esp32-pico-mini-iot-development-kit)                                                                                |  :ok:  | :ok:  |   :ok:   |         :ok:         | :ok: | :ok:¹  |   :x:   |  Tone   |    :x:     |     :x:²     |
-| [M5Stack M5Core BASIC](https://shop.m5stack.com/products/basic-core-iot-development-kit)                                                                                                    |  :ok:  | :ok:  |   :ok:   |         :ok:         | :ok: | :ok:¹  |   :x:   |  Tone   |    :x:     |     :x:      |
-| [M5Stack M5Core2](https://shop.m5stack.com/products/m5stack-core2-esp32-iot-development-kit-v1-1)                                                                                           |  :ok:  | :ok:  |   :ok:   |         :ok:         | :ok: | :ok:¹  |   :x:   |   :x:   |    :x:     |     :x:      |
-| [M5Stack M5CoreS3](https://shop.m5stack.com/products/m5stack-cores3-esp32s3-lotdevelopment-kit)/[SE](https://shop.m5stack.com/products/m5stack-cores3-se-iot-controller-w-o-battery-bottom) |  :ok:  | :ok:  |   :ok:   |         :ok:         | :x:  |  :ok:  |   :x:   |   :x:   |    :x:     |     :x:      |
-| [JCZN CYD&#x2011;2432S028](https://www.aliexpress.us/item/3256804774970998.html)                                                                                                            |  :ok:  | :ok:  |   :ok:   |         :ok:         | :x:  | :ok:¹  |   :x:   |   :x:   |    :x:     |     :x:²     |
-| [Lilygo T&#x2011;Embed CC1101](https://lilygo.cc/products/t-embed-cc1101)                                                                                                                   |  :ok:  | :ok:  |   :ok:   |         :ok:         | :ok: |  :ok:  |  :ok:   |  :ok:   |    :ok:    |     :x:      |
-| [Lilygo T&#x2011;Embed](https://lilygo.cc/products/t-embed)                                                                                                                                 |  :ok:  | :ok:  |   :ok:   |         :ok:         | :ok: |  :ok:  |  :ok:   |  :ok:   |    :x:     |     :x:      |
-| [Lilygo T-Display-S3](https://lilygo.cc/products/t-display-s3)                                                                                                                              |  :ok:  | :ok:  |   :x:    |         :x:          | :x:  |  :ok:  |   :x:   |   :x:   |    :x:     |     :x:      |
-| [Lilygo T&#x2011;Deck](https://lilygo.cc/products/t-deck) ([and pro](https://lilygo.cc/products/t-deck-plus-1))                                                                             |  :ok:  |  :x:  |   :x:    |         :x:          | :x:  |  :ok:  |   :x:   |   :x:   |    :x:     |     :x:      |
-| [Lilygo T-Watch-S3](https://lilygo.cc/products/t-watch-s3)                                                                                                                                  |  :x:   |  :x:  |   :x:    |         :x:          | :x:  |  :ok:  |   :x:   |   :x:   |    :x:     |     :x:      |
-| [Lilygo T-LoRa Pager](https://lilygo.cc/products/t-lora-pager)                                                                                                                              |  :x:   |  :x:  |   :x:    |         :x:          | :x:  |  :ok:  |   :x:   |   :x:   |    :x:     |     :x:      |
-| [Smoochiee V2](https://www.pcbway.com/project/shareproject/Bruce_PCB_Smoochiee_d6a0284b.html)                                                                                               |  :ok:  | :ok:  |   :x:    |         :ok:         | :x:  |  :ok:  |   :x:   |   :x:   |    :x:     |     :x:      |
-| [ESP32-C5](https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32c5/esp32-c5-devkitc-1/user_guide.html)                                                                           |  :ok:  | :ok:  |   :x:    |         :ok:         | :x:  |  :x:   |   :x:   |   :x:   |    :x:     |     :x:      |
-| [Bruce RF Reaper](https://www.elecrow.com/bruce-pcb-rf-reaper.html)                                                                                                                         |  :ok:  | :ok:  |   :x:    | :x: but w/ ST25R3916 | :x:  |  :ok:  |  :ok:   |   :x:   |    :ok:    |     :x:      |
-| [Elecrow 24B](https://www.elecrow.com/2-4inch-esp32-miner-lcd-display-2pcs-cryptocurrency-solo-miner-with-1000kh-s-hashrate.html)                                                                                                                         |  :ok:  | :ok:  |   :x:    | :x: but w/ ST25R3916 | :x:  |  :ok:  |  :ok:   |   :x:   |    :ok:    |     :x:      |
-² CYD have a LITE_VERSION version for Launcher Compatibility
-¹ Core, CYD and StickCs Bad-USB: [here](https://wiki.bruce.computer/features/others/#badusb)
-
-_LITE_VERSION_: TelNet, SSH, WireGuard, ScanHosts, RawSniffer, Brucegotchi, BLEBacon, BLEScan and Interpreter are NOT available for M5Launcher Compatibility
-
-## :sparkles: Why and how does it look?
-
-Bruce stems from a keen observation within the community focused on devices like Flipper Zero. While these devices offered a glimpse into the world of offensive security, there was a palpable sense that something more could be achieved without being that overpriced, particularly with the robust and modular hardware ecosystem provided by ESP32 Devices, Lilygo and M5Stack products.
-
-![Bruce Main Menu](./media/pictures/pic1.png)
-![Bruce on M5Core](./media/pictures/core.png)
-![Bruce on Stick](./media/pictures/stick.png)
-![Bruce on CYD](./media/pictures/cyd.png)
-
-Other media can be [found here](./media/).
-
 ## :clap: Acknowledgements
 
-- [@bmorcelli](https://github.com/bmorcelli) for new core and a bunch of new features, also porting to many devices!
-- [@IncursioHack](https://github.com/IncursioHack) for adding RF and RFID modules features.
-- [@Luidiblu](https://github.com/Luidiblu) for logo and UI design assistance.
-- [@eadmaster](https://github.com/eadmaster) for adding a lot of features.
-- [@rennancockles](https://github.com/rennancockles) for a lot of RFID code, refactoring and others features.
-- [@7h30th3r0n3](https://github.com/7h30th3r0n3) refactoring and a lot of help with WiFi attacks.
-- [@Tawank](https://github.com/Tawank) refactoring interpreter among many other things
-- [@pablonymous]() new RF functions to read RAW Data
-- [Smoochiee]() for Bruce PCB design.
-- [TH3_KR4K3N]() for Stick cplus extender PCB design.
-- Everyone who contributed in some way to the project, thanks :heart:
+This fork stands entirely on upstream [Bruce](https://github.com/pr3y/Bruce) and its contributors.
+Thanks to [@pr3y](https://github.com/pr3y), [@bmorcelli](https://github.com/bmorcelli),
+[@IncursioHack](https://github.com/IncursioHack), [@rennancockles](https://github.com/rennancockles),
+[@7h30th3r0n3](https://github.com/7h30th3r0n3), [@eadmaster](https://github.com/eadmaster),
+[@Tawank](https://github.com/Tawank), and everyone who contributed to the project. :heart:
 
 ## :construction: Disclaimer
 
