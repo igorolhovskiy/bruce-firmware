@@ -107,6 +107,10 @@ bool RFID2::PICC_IsNewCardPresent() {
 int RFID2::read(int cardBaudRate) {
     pageReadStatus = FAILURE;
 
+    // Clear any Crypto1 state left over from a previous failed authentication so the
+    // reader can detect the next card (a dirty crypto unit blocks REQA/anticollision).
+    mfrc522.PCD_StopCrypto1();
+
     if (!PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) return TAG_NOT_PRESENT;
 
     displayInfo("Reading data blocks...");
@@ -453,8 +457,9 @@ int RFID2::authenticate_mifare_classic(byte block) {
     }
 
     if (statusA != MFRC522::StatusCode::STATUS_OK) {
-        for (const auto &key : _dictKeys) {
-            memcpy(keyA.keyByte, key.data(), 6);
+        for (size_t i = 0; i < _dictKeys.size(); i++) {
+            if ((i & 0x1F) == 0) progressHandler((int)i, _dictKeys.size(), "Dictionary key A");
+            memcpy(keyA.keyByte, _dictKeys[i].data(), 6);
 
             statusA = mfrc522.PCD_Authenticate(
                 MFRC522::PICC_Command::PICC_CMD_MF_AUTH_KEY_A, block, &keyA, &mfrc522.uid
@@ -492,8 +497,9 @@ int RFID2::authenticate_mifare_classic(byte block) {
     }
 
     if (statusB != MFRC522::StatusCode::STATUS_OK) {
-        for (const auto &key : _dictKeys) {
-            memcpy(keyB.keyByte, key.data(), 6);
+        for (size_t i = 0; i < _dictKeys.size(); i++) {
+            if ((i & 0x1F) == 0) progressHandler((int)i, _dictKeys.size(), "Dictionary key B");
+            memcpy(keyB.keyByte, _dictKeys[i].data(), 6);
 
             statusB = mfrc522.PCD_Authenticate(
                 MFRC522::PICC_Command::PICC_CMD_MF_AUTH_KEY_B, block, &keyB, &mfrc522.uid
@@ -504,9 +510,12 @@ int RFID2::authenticate_mifare_classic(byte block) {
         }
     }
 
-    return (statusA == MFRC522::StatusCode::STATUS_OK && statusB == MFRC522::StatusCode::STATUS_OK)
-               ? SUCCESS
-               : TAG_AUTH_ERROR;
+    if (statusA == MFRC522::StatusCode::STATUS_OK && statusB == MFRC522::StatusCode::STATUS_OK)
+        return SUCCESS;
+
+    // Failed to authenticate: leave the crypto unit clean so the next read isn't blocked.
+    mfrc522.PCD_StopCrypto1();
+    return TAG_AUTH_ERROR;
 }
 
 int RFID2::read_mifare_ultralight_data_blocks() {
