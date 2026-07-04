@@ -10,6 +10,8 @@
 #include <MFRC522Driver.h>
 #include <MFRC522DriverPinSimple.h>
 #include <MFRC522v2.h>
+#include <array>
+#include <vector>
 
 class RFID2 : public RFIDInterface {
 public:
@@ -41,6 +43,11 @@ private:
     bool _use_i2c;
     MFRC522Driver *_driver;
     MFRC522DriverPinSimple ss_pin = MFRC522DriverPinSimple(SPI_SS_PIN);
+
+    // MIFARE Classic keys loaded from an SD/LittleFS dictionary file (see MF_KEY_DICT_PATH),
+    // tried during authentication in addition to the built-in and user-saved keys.
+    std::vector<std::array<uint8_t, 6>> _dictKeys;
+    void load_key_dictionary();
 
     /////////////////////////////////////////////////////////////////////////////////////
     // Converters

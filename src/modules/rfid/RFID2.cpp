@@ -16,6 +16,10 @@
 
 #define RFID2_I2C_ADDRESS 0x28
 
+// Optional MIFARE Classic key dictionary (one 12-hex-char key per line, '#' comments).
+// Auto-loaded from SD (or LittleFS) on begin() and tried during authentication.
+#define MF_KEY_DICT_PATH "/BruceRFID/mf_keys.dic"
+
 // On boards whose keyboard/touch own the primary I2C bus (Wire), the board header
 // routes Grove I2C units to a dedicated secondary bus so they can't clobber it.
 #ifndef GROVE_I2C_WIRE
@@ -41,7 +45,45 @@ bool RFID2::begin() {
 
     MFRC522::PCD_Version version = mfrc522.PCD_GetVersion();
 
+    load_key_dictionary();
+
     return i2c_check || version != MFRC522::PCD_Version::Version_Unknown;
+}
+
+void RFID2::load_key_dictionary() {
+    _dictKeys.clear();
+
+    FS *fs;
+    if (!getFsStorage(fs)) return;
+    if (!(*fs).exists(MF_KEY_DICT_PATH)) return;
+
+    File file = (*fs).open(MF_KEY_DICT_PATH, FILE_READ);
+    if (!file) return;
+
+    while (file.available()) {
+        String line = file.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0 || line.startsWith("#")) continue;
+        line.replace(" ", "");
+        if (line.length() < 12) continue;
+
+        std::array<uint8_t, 6> key;
+        bool valid = true;
+        for (int i = 0; i < 6; i++) {
+            String byteStr = line.substring(i * 2, i * 2 + 2);
+            char *endptr = nullptr;
+            long value = strtol(byteStr.c_str(), &endptr, 16);
+            if (endptr == byteStr.c_str() || *endptr != '\0') {
+                valid = false;
+                break;
+            }
+            key[i] = (uint8_t)value;
+        }
+        if (valid) _dictKeys.push_back(key);
+    }
+
+    file.close();
+    Serial.printf("[RFID2] Loaded %d key(s) from %s\n", (int)_dictKeys.size(), MF_KEY_DICT_PATH);
 }
 
 bool RFID2::PICC_IsNewCardPresent() {
@@ -394,6 +436,19 @@ int RFID2::authenticate_mifare_classic(byte block) {
         }
     }
 
+    if (statusA != MFRC522::StatusCode::STATUS_OK) {
+        for (const auto &key : _dictKeys) {
+            memcpy(keyA.keyByte, key.data(), 6);
+
+            statusA = mfrc522.PCD_Authenticate(
+                MFRC522::PICC_Command::PICC_CMD_MF_AUTH_KEY_A, block, &keyA, &mfrc522.uid
+            );
+            if (statusA == MFRC522::StatusCode::STATUS_OK) break;
+
+            if (!PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) { return TAG_NOT_PRESENT; }
+        }
+    }
+
     for (auto key : keys) {
         memcpy(keyB.keyByte, key, 6);
 
@@ -413,6 +468,19 @@ int RFID2::authenticate_mifare_classic(byte block) {
 
             statusB = mfrc522.PCD_Authenticate(
                 MFRC522::PICC_Command::PICC_CMD_MF_AUTH_KEY_A, block, &keyB, &mfrc522.uid
+            );
+            if (statusB == MFRC522::StatusCode::STATUS_OK) break;
+
+            if (!PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) { return TAG_NOT_PRESENT; }
+        }
+    }
+
+    if (statusB != MFRC522::StatusCode::STATUS_OK) {
+        for (const auto &key : _dictKeys) {
+            memcpy(keyB.keyByte, key.data(), 6);
+
+            statusB = mfrc522.PCD_Authenticate(
+                MFRC522::PICC_Command::PICC_CMD_MF_AUTH_KEY_B, block, &keyB, &mfrc522.uid
             );
             if (statusB == MFRC522::StatusCode::STATUS_OK) break;
 
