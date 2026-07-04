@@ -235,6 +235,7 @@ void TagOMatic::loop() {
             case EMULATE_MODE: emulate_card(); break;
             case NTAG_TOOLS_MODE: ntag_tools(); break;
             case LOG_MODE: log_uids(); break;
+            case UNBRICK_MODE: unbrick_card(); break;
             case ERASE_MODE: erase_card(); break;
             case SAVE_MODE: save_file(); break;
         }
@@ -259,6 +260,7 @@ void TagOMatic::select_state() {
     options.emplace_back("Load file", [this]() { set_state(LOAD_MODE); });
     options.emplace_back("Write NDEF", [this]() { set_state(WRITE_NDEF_MODE); });
     options.emplace_back("Erase tag", [this]() { set_state(ERASE_MODE); });
+    options.emplace_back("Unbrick magic", [this]() { set_state(UNBRICK_MODE); });
 
     loopOptions(options);
 }
@@ -333,6 +335,7 @@ void TagOMatic::display_banner() {
         case EMULATE_MODE: printSubtitle("EMULATE MODE"); break;
         case NTAG_TOOLS_MODE: printSubtitle("NTAG TOOLS"); break;
         case LOG_MODE: printSubtitle("UID LOGGER"); break;
+        case UNBRICK_MODE: printSubtitle("UNBRICK MAGIC"); break;
         case SAVE_MODE: printSubtitle("SAVE MODE"); break;
     }
 
@@ -586,6 +589,19 @@ void TagOMatic::write_custom_uid() {
 
     delayWithReturn(200);
     set_state(CLONE_MODE);
+}
+
+void TagOMatic::unbrick_card() {
+    display_banner();
+    padprintln("Place the bricked magic card...");
+    int result = _rfid->unbrick_magic();
+
+    if (result == RFIDInterface::SUCCESS) displaySuccess("Magic card recovered.", true);
+    else if (result == RFIDInterface::NOT_IMPLEMENTED) displayError("Not supported by module.", true);
+    else displayError("Unbrick failed. Retry with card on reader.", true);
+
+    delayWithReturn(500);
+    set_state(READ_MODE);
 }
 
 void TagOMatic::erase_card() {

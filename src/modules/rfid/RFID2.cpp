@@ -125,7 +125,23 @@ int RFID2::clone() {
     MFRC522Hack mfrc522Hack(mfrc522, true);
     MFRC522::MIFARE_Key key = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
+    // Try the gen1a backdoor first; if the card doesn't have one, fall back to a
+    // direct block-0 write (gen2 / CUID cards allow this after sector-0 auth).
     bool success = mfrc522Hack.MIFARE_SetUid(uid.uidByte, uid.size, key, true);
+    if (!success) {
+        if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) return TAG_NOT_PRESENT;
+        success = mfrc522Hack.MIFARE_SetUid(uid.uidByte, uid.size, key, false);
+    }
+
+    mfrc522.PICC_HaltA();
+    return success ? SUCCESS : FAILURE;
+}
+
+int RFID2::unbrick_magic() {
+    // gen1a "magic" cards with a corrupted block 0 can be recovered via the
+    // backdoor, which MIFARE_UnbrickUidSector() opens itself (no prior select).
+    MFRC522Hack mfrc522Hack(mfrc522, true);
+    bool success = mfrc522Hack.MIFARE_UnbrickUidSector();
     mfrc522.PICC_HaltA();
     return success ? SUCCESS : FAILURE;
 }

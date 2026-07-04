@@ -25,6 +25,7 @@ public:
         EMULATE_MODE,
         NTAG_TOOLS_MODE,
         LOG_MODE,
+        UNBRICK_MODE,
         ERASE_MODE,
         LOAD_MODE,
         SAVE_MODE
@@ -99,6 +100,7 @@ private:
     void write_custom_uid();
     void clone_card();
     void emulate_card();
+    void unbrick_card();
     void erase_card();
     void write_data();
     void write_ndef_data();

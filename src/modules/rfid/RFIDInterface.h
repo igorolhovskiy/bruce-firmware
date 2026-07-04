@@ -102,6 +102,9 @@ public:
     virtual int set_password(uint32_t pwd, uint16_t pack) { return NOT_IMPLEMENTED; }
     virtual int remove_password(uint32_t pwd) { return NOT_IMPLEMENTED; }
 
+    // Recover a bricked gen1a "magic" MIFARE card (rewrite sector 0 via backdoor).
+    virtual int unbrick_magic() { return NOT_IMPLEMENTED; }
+
     String statusMessage(int status) const {
         switch (status) {
             case SUCCESS: return String(F("Success"));

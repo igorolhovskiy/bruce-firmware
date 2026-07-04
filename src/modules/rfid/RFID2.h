@@ -46,6 +46,7 @@ public:
     int read_counter(uint32_t &out) override;
     int set_password(uint32_t pwd, uint16_t pack) override;
     int remove_password(uint32_t pwd) override;
+    int unbrick_magic() override;
 
 private:
     bool _use_i2c;
