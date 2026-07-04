@@ -48,6 +48,10 @@ public:
     int instantBoot = 0;
     String keyboardLang = "QWERTY"; // "QWERTY" | "AZERTY" | "QWERTZ"
 
+    // Input tuning (used by the T-Deck trackball/touch interface)
+    int trackballSensitivity = 3; // trackball pulses required per navigation step (1 = most sensitive)
+    int touchEnabled = 1;         // 0 = ignore the touchscreen entirely
+
 #ifdef HAS_RGB_LED
     // Led
     int ledBright = 50;
@@ -134,6 +138,10 @@ public:
     void validateSoundVolumeValue();
     void setWifiAtStartup(int value);
     void validateWifiAtStartupValue();
+    void setTrackballSensitivity(int value);
+    void validateTrackballSensitivityValue();
+    void setTouchEnabled(int value);
+    void validateTouchEnabledValue();
 
 #ifdef HAS_RGB_LED
     // Led

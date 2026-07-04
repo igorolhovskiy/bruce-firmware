@@ -62,6 +62,8 @@ void setSleepMode();
 
 void setDimmerTimeMenu();
 
+void setTrackballSensitivityMenu();
+
 void setClock();
 
 void runClockLoop(bool showMenuHint = false);

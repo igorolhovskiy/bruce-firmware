@@ -23,6 +23,8 @@ JsonDocument BruceConfig::toJson() const {
     setting["wifiAtStartup"] = wifiAtStartup;
     setting["instantBoot"] = instantBoot;
     setting["keyboardLang"] = keyboardLang;
+    setting["trackballSensitivity"] = trackballSensitivity;
+    setting["touchEnabled"] = touchEnabled;
 
 #ifdef HAS_RGB_LED
     setting["ledBright"] = ledBright;
@@ -216,6 +218,18 @@ void BruceConfig::fromFile(bool checkFS) {
         keyboardLang = setting["keyboardLang"].as<String>();
     } else {
         keyboardLang = "QWERTY";
+    }
+    if (!setting["trackballSensitivity"].isNull()) {
+        trackballSensitivity = setting["trackballSensitivity"].as<int>();
+    } else {
+        count++;
+        log_e("Fail");
+    }
+    if (!setting["touchEnabled"].isNull()) {
+        touchEnabled = setting["touchEnabled"].as<int>();
+    } else {
+        count++;
+        log_e("Fail");
     }
 
 #ifdef HAS_RGB_LED
@@ -474,6 +488,8 @@ void BruceConfig::validateConfig() {
     validateSoundEnabledValue();
     validateSoundVolumeValue();
     validateWifiAtStartupValue();
+    validateTrackballSensitivityValue();
+    validateTouchEnabledValue();
 #ifdef HAS_RGB_LED
     validateLedBrightValue();
     validateLedColorValue();
@@ -572,6 +588,27 @@ void BruceConfig::setWifiAtStartup(int value) {
 
 void BruceConfig::validateWifiAtStartupValue() {
     if (wifiAtStartup > 1) wifiAtStartup = 1;
+}
+
+void BruceConfig::setTrackballSensitivity(int value) {
+    trackballSensitivity = value;
+    validateTrackballSensitivityValue();
+    saveFile();
+}
+
+void BruceConfig::validateTrackballSensitivityValue() {
+    if (trackballSensitivity < 1) trackballSensitivity = 1;
+    if (trackballSensitivity > 10) trackballSensitivity = 10;
+}
+
+void BruceConfig::setTouchEnabled(int value) {
+    touchEnabled = value;
+    validateTouchEnabledValue();
+    saveFile();
+}
+
+void BruceConfig::validateTouchEnabledValue() {
+    if (touchEnabled != 0) touchEnabled = 1;
 }
 
 #ifdef HAS_RGB_LED

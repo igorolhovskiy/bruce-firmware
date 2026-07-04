@@ -196,6 +196,23 @@ void setDimmerTimeMenu() {
 }
 
 /*********************************************************************
+**  Function: setTrackballSensitivityMenu
+**  Trackball pulses required per navigation step (1 = most sensitive)
+**********************************************************************/
+void setTrackballSensitivityMenu() {
+    options = {
+        {"1 (High)",   [=]() { bruceConfig.setTrackballSensitivity(1); }, bruceConfig.trackballSensitivity == 1},
+        {"2",          [=]() { bruceConfig.setTrackballSensitivity(2); }, bruceConfig.trackballSensitivity == 2},
+        {"3 (Default)",[=]() { bruceConfig.setTrackballSensitivity(3); }, bruceConfig.trackballSensitivity == 3},
+        {"4",          [=]() { bruceConfig.setTrackballSensitivity(4); }, bruceConfig.trackballSensitivity == 4},
+        {"5 (Low)",    [=]() { bruceConfig.setTrackballSensitivity(5); }, bruceConfig.trackballSensitivity == 5},
+    };
+    int idx = bruceConfig.trackballSensitivity - 1;
+    if (idx < 0 || idx > 4) idx = 2;
+    loopOptions(options, idx);
+}
+
+/*********************************************************************
 **  Function: setUIColor
 **  Set and store main UI color
 **********************************************************************/
