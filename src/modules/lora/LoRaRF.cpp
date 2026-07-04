@@ -206,7 +206,7 @@ void reciveMessage() {
                     : (lora1276 ? lora1276->readData(incoming) : -1);
     if (state == RADIOLIB_ERR_NONE) {
         rcvmsg = incoming;
-        Serial.println("Recived:" + rcvmsg);
+        Serial.println("Received:" + rcvmsg);
         File file = LittleFS.open("/chats.txt", "a");
         file.println(rcvmsg);
         file.close();

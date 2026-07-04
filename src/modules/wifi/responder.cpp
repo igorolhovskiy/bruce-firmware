@@ -474,7 +474,7 @@ void sendSMB2NegotiateFromSMB1() {
     resp[3] = (total - 4);
 
     smbState.client.write(resp, total);
-    Serial.println(F("→ Negotiate Response SMB‑v2 send (upgrade successfull)"));
+    Serial.println(F("→ Negotiate Response SMB‑v2 send (upgrade successful)"));
 }
 
 void handleSMB1(uint8_t *pkt, uint32_t len) {
