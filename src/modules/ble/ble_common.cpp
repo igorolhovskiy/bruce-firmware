@@ -44,48 +44,150 @@ uint8_t sta_mac[6];
 char strID[18];
 char strAddl[200];
 
-void ble_info(String name, String address, String signal) {
+// Resolve a Bluetooth SIG company identifier (the first 2 bytes of manufacturer-
+// specific advertising data) to a vendor name. Covers the common consumer vendors;
+// unknown IDs return "". Works even for devices using randomized/private addresses,
+// since the company ID is in the advertised payload, not the MAC.
+static String bleCompanyName(uint16_t id) {
+    switch (id) {
+    case 0x004C: return "Apple";
+    case 0x0006: return "Microsoft";
+    case 0x00E0: return "Google";
+    case 0x0075: return "Samsung";
+    case 0x0087: return "Garmin";
+    case 0x009E: return "Bose";
+    case 0x012D: return "Sony";
+    case 0x0157: return "Huami/Amazfit";
+    case 0x038F: return "Xiaomi";
+    case 0x0059: return "Nordic Semi";
+    case 0x0171: return "Amazon";
+    case 0x02E5: return "Espressif";
+    case 0x000D: return "Texas Instruments";
+    case 0x000F: return "Broadcom";
+    case 0x0002: return "Intel";
+    case 0x000A: return "Qualcomm/CSR";
+    case 0x00C4: return "LG Electronics";
+    case 0x0001: return "Nokia";
+    case 0x0004: return "Toshiba";
+    case 0x0499: return "Ruuvi";
+    case 0x0078: return "Nike";
+    default: return "";
+    }
+}
+
+// Map a GAP Appearance value to a human category label ("" if unknown/absent).
+static String bleAppearanceName(uint16_t a) {
+    if (a == 0) return "";
+    switch (a >> 6) { // top 10 bits = category
+    case 1: return "Phone";
+    case 2: return "Computer";
+    case 3: return "Watch";
+    case 4: return "Clock";
+    case 5: return "Display";
+    case 6: return "Remote";
+    case 7: return "Glasses";
+    case 8: return "Tag";
+    case 9: return "Keyring";
+    case 10: return "Media Player";
+    case 11: return "Barcode Scanner";
+    case 12: return "Thermometer";
+    case 13: return "Heart Rate";
+    case 14: return "Blood Pressure";
+    case 15:
+        switch (a) {
+        case 0x03C1: return "Keyboard";
+        case 0x03C2: return "Mouse";
+        case 0x03C3: return "Joystick";
+        case 0x03C4: return "Gamepad";
+        default: return "HID";
+        }
+    case 16: return "Glucose Meter";
+    case 17: return "Run/Walk Sensor";
+    case 18: return "Cycling";
+    case 20: return "Pulse Oximeter";
+    case 21: return "Weight Scale";
+    case 49: return "Outdoor Sports";
+    default: return "";
+    }
+}
+
+// Walk the raw advertising payload's AD structures to pull the manufacturer
+// company ID (type 0xFF) and the Appearance (type 0x19), for name resolution.
+static void bleParsePayload(const NimBLEAdvertisedDevice *d, uint16_t &companyId, uint16_t &appearance) {
+    companyId = 0;
+    appearance = 0;
+    const std::vector<uint8_t> &pl = d->getPayload();
+    size_t plen = pl.size();
+    size_t i = 0;
+    while (i + 1 < plen) {
+        uint8_t len = pl[i];
+        if (len == 0 || i + 1 + len > plen) break;
+        uint8_t type = pl[i + 1];
+        if (type == 0xFF && len >= 3) companyId = pl[i + 2] | (pl[i + 3] << 8);
+        else if (type == 0x19 && len >= 3) appearance = pl[i + 2] | (pl[i + 3] << 8);
+        i += 1 + len;
+    }
+}
+
+void ble_info(
+    String name, String address, String signal, String vendor = "", String appearance = ""
+) {
     drawMainBorder();
     tft.setTextColor(bruceConfig.priColor);
     tft.drawCentreString("-=Information=-", tftWidth / 2, 28, SMOOTH_FONT);
     tft.drawString("Name: " + name, 10, 48);
     tft.drawString("Adresse: " + address, 10, 66);
     tft.drawString("Signal: " + String(signal) + " dBm", 10, 84);
-    tft.drawCentreString("   Press " + String(BTN_ALIAS) + " to act", tftWidth / 2, tftHeight - 20, 1);
+    int y = 102;
+    if (!vendor.isEmpty()) {
+        tft.drawString("Vendor: " + vendor, 10, y);
+        y += 18;
+    }
+    if (!appearance.isEmpty()) { tft.drawString("Type: " + appearance, 10, y); }
+    tft.drawCentreString("Backspace: back to list", tftWidth / 2, tftHeight - 20, 1);
 
     delay(300);
-    while (!check(SelPress)) {
-        while (!check(SelPress)) { yield(); } // timerless debounce
-        returnToMenu = true;
-        break;
+    check(EscPress); // clear any stale press from entering this screen
+    check(SelPress);
+    while (true) {
+        if (check(EscPress)) return; // Backspace -> back to the scan list
+        check(SelPress);             // Mid is a no-op here; swallow it so it doesn't leak to the list
+        yield();
     }
 }
+// Build one scan-list entry with name resolution: use the advertised name when
+// present; otherwise fall back to the resolved vendor "[Apple]" (from the company
+// ID), and only then the bare address. The detail view gets vendor + device type.
+static void addBleScanOption(const NimBLEAdvertisedDevice *d) {
+    if (options.size() >= 250) {
+        Serial.println("Memory low, stopping BLE scan...");
+        if (pBLEScan) pBLEScan->stop();
+        return;
+    }
+    String name = d->getName().c_str();
+    String address = d->getAddress().toString().c_str();
+    String signal = String(d->getRSSI());
+
+    uint16_t companyId = 0, appr = 0;
+    bleParsePayload(d, companyId, appr);
+    String vendor = companyId ? bleCompanyName(companyId) : "";
+    String appearance = bleAppearanceName(appr);
+
+    String title;
+    if (!name.isEmpty()) title = name;
+    else if (!vendor.isEmpty()) title = "[" + vendor + "]";
+    else title = address;
+    String infoName = name.isEmpty() ? "<no name>" : name;
+
+    options.emplace_back(title.c_str(), [=]() { ble_info(infoName, address, signal, vendor, appearance); });
+}
+
 #ifdef NIMBLE_V2_PLUS
 class AdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
 #else
 class AdvertisedDeviceCallbacks : public NimBLEAdvertisedDeviceCallbacks {
 #endif
-    void onResult(NimBLEAdvertisedDevice *advertisedDevice) {
-        String bt_title;
-        String bt_name;
-        String bt_address;
-        String bt_signal;
-
-        bt_name = advertisedDevice->getName().c_str();
-        bt_title = advertisedDevice->getName().c_str();
-        bt_address = advertisedDevice->getAddress().toString().c_str();
-        bt_signal = String(advertisedDevice->getRSSI());
-        // Serial.println("\n\nAddress - " + bt_address + "Name-"+ bt_name +"\n\n");
-        if (bt_title.isEmpty()) bt_title = bt_address;
-        if (bt_name.isEmpty()) bt_name = "<no name>";
-        // If BT name is empty, set NONAME
-        if (options.size() < 250)
-            options.emplace_back(bt_title.c_str(), [=]() { ble_info(bt_name, bt_address, bt_signal); });
-        else {
-            Serial.println("Memory low, stopping BLE scan...");
-            pBLEScan->stop();
-        }
-    }
+    void onResult(NimBLEAdvertisedDevice *advertisedDevice) { addBleScanOption(advertisedDevice); }
 };
 
 static bool is_ble_inited = false;
@@ -174,26 +276,7 @@ void ble_scan() {
 #ifdef NIMBLE_V2_PLUS
     BLEScanResults foundDevices = pBLEScan->getResults(scanTime * 1000, false);
     for (int i = 0; i < foundDevices.getCount(); i++) {
-        const NimBLEAdvertisedDevice *advertisedDevice = foundDevices.getDevice(i);
-        String bt_title;
-        String bt_name;
-        String bt_address;
-        String bt_signal;
-
-        bt_name = advertisedDevice->getName().c_str();
-        bt_title = advertisedDevice->getName().c_str();
-        bt_address = advertisedDevice->getAddress().toString().c_str();
-        bt_signal = String(advertisedDevice->getRSSI());
-        // Serial.println("\n\nAddress - " + bt_address + "Name-"+ bt_name +"\n\n");
-        if (bt_title.isEmpty()) bt_title = bt_address;
-        if (bt_name.isEmpty()) bt_name = "<no name>";
-        // If BT name is empty, set NONAME
-        if (options.size() < 250)
-            options.emplace_back(bt_title.c_str(), [=]() { ble_info(bt_name, bt_address, bt_signal); });
-        else {
-            Serial.println("Memory low, stopping BLE scan...");
-            pBLEScan->stop();
-        }
+        addBleScanOption(foundDevices.getDevice(i));
     }
 #else
     BLEScanResults foundDevices = pBLEScan->start(scanTime, false);
@@ -201,7 +284,14 @@ void ble_scan() {
 
     addOptionToMainMenu();
 
-    loopOptions(options);
+    // loopOptions() exits the list every time a selected item's callback returns,
+    // so re-show it in a loop: viewing a device (ble_info) returns here with
+    // returnToMenu still false (Backspace = back to list); it's only left when
+    // ble_info's "act" sets returnToMenu, the "Main Menu" item is chosen, or
+    // Backspace is pressed on the list itself (loopOptions returns -1).
+    while (!returnToMenu) {
+        if (loopOptions(options) == -1) break;
+    }
     options.clear();
 
     // Delete results fromBLEScan buffer to release memory
