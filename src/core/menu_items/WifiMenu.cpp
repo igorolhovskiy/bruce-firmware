@@ -11,6 +11,7 @@
 #include "modules/wifi/clients.h"
 #include "modules/wifi/evil_portal.h"
 #include "modules/wifi/karma_attack.h"
+#include "modules/wifi/passive_recon.h"
 #include "modules/wifi/netcut.h"
 #include "modules/wifi/responder.h"
 #include "modules/wifi/scan_hosts.h"
@@ -73,6 +74,7 @@ void WifiMenu::optionsMenu() {
     options.push_back({"TelNET", telnet_setup});
     options.push_back({"SSH", lambdaHelper(ssh_setup, String(""))});
     options.push_back({"Sniffer", sniffer_setup});
+    options.push_back({"Passive Recon", passive_recon});
     options.push_back({"Scan Hosts", [=]() {
                            bool doScan = true;
                            if (!wifiConnected) doScan = wifiConnectMenu();
