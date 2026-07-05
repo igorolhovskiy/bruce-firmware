@@ -18,6 +18,9 @@ Meshtastic nodes/apps using the well-known default channel key.
 - **Sends** text you compose on the QWERTY keyboard: builds a `Data` protobuf, encrypts it, frames it
   with a correct 16-byte `PacketHeader` (broadcast destination, our node-ID, hop-limit 3), and
   transmits — subject to a **mandatory EU868 10 % duty-cycle limiter**.
+- **Announces itself** with a periodic **NodeInfo** broadcast (`User`: id / long / short name derived
+  from the node-ID, e.g. `Bruce c114` / `c114`) — sent ~8 s after opening and every 30 min after — so
+  peers list this device by name instead of a bare `!id`. Duty-cycle guarded like any transmit.
 - Shows a **conversation** view, a **compose** action, and a **nodes-heard** view with names decoded
   from NODEINFO packets. Optional **SD logging** of the conversation to CSV.
 

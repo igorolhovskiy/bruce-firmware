@@ -71,6 +71,14 @@ volatile bool txInProgress = false;  // true only while transmit() is running
 bool lastTxBlocked = false;          // last send attempt was refused by the guard
 uint32_t lastTxBlockedWaitS = 0;
 
+// Self-NodeInfo broadcast so peers show a name instead of a bare !id. Names are
+// derived from the node-ID at open (no extra config/storage needed).
+char meshLongName[24] = {0};
+char meshShortName[8] = {0};
+constexpr uint32_t NODEINFO_INTERVAL_MS = 30UL * 60 * 1000; // re-announce every 30 min
+constexpr uint32_t NODEINFO_FIRST_MS = 8000;                // first announce ~8s after open
+uint32_t nextNodeInfoAtMs = 0;
+
 // --- UI state (Phase 6) ---
 enum class View { Conversation, Nodes };
 View view = View::Conversation;
@@ -83,6 +91,7 @@ struct ConvMsg {
     float rssi;
     float snr;
     uint32_t atMs;
+    String clk; // "HH:MM:SS" wall-clock at arrival, or "+HH:MM:SS" uptime if clock unset
 };
 std::vector<ConvMsg> convo; // oldest at front, newest at back
 constexpr size_t MAX_CONVO = 60;
@@ -104,6 +113,37 @@ int nodesTop = 0;
 // SD conversation logging (Phase 8). CSV, appended per message; best-effort.
 bool meshSdLog = false;
 constexpr const char *MESH_LOG_PATH = "/meshtastic_log.csv";
+// Raw RX diagnostic log (every frame, decoded or not) so an unattended overnight
+// run can be inspected later. Best-effort; shares the same SD availability flag.
+constexpr const char *MESH_RAW_PATH = "/meshtastic_raw.log";
+
+// Append one line to the raw diagnostic log (best-effort; skips if no SD). All
+// raw-log writes happen from the main loop (processMeshRx / decodeMeshFrame),
+// never the RX ISR, so they don't race the radio on the shared SPI bus.
+void logMeshRawLine(const String &s) {
+    if (!meshSdLog) return;
+    File f = SD.open(MESH_RAW_PATH, FILE_APPEND);
+    if (!f) return;
+    f.println(s);
+    f.close();
+}
+
+// Current wall-clock as "HH:MM:SS" for message timestamps. Until the clock is set
+// (the T-Deck syncs it from GPS/NTP), falls back to device uptime as "+HH:MM:SS" -
+// the leading '+' marks it as relative (time since boot), not wall-clock.
+String nowClock() {
+    if (clock_set) {
+        struct tm t = rtc.getTimeStruct();
+        char b[9];
+        snprintf(b, sizeof(b), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+        return String(b);
+    }
+    uint32_t s = millis() / 1000;
+    char b[16];
+    snprintf(b, sizeof(b), "+%02u:%02u:%02u", (unsigned)(s / 3600), (unsigned)((s / 60) % 60),
+             (unsigned)(s % 60));
+    return String(b);
+}
 
 // Returns the known short name for a node, or "" if none heard yet.
 String nodeName(uint32_t id) {
@@ -184,6 +224,7 @@ void addConvMsg(uint32_t from, bool mine, const String &text, float rssi, float 
     m.rssi = rssi;
     m.snr = snr;
     m.atMs = millis();
+    m.clk = nowClock();
     convo.push_back(m);
     if (convo.size() > MAX_CONVO) convo.erase(convo.begin());
     if (convScroll != 0) convScroll++; // keep the same messages in view when not pinned to bottom
@@ -328,10 +369,20 @@ void decodeMeshFrame(const uint8_t *buf, size_t len, float rssi, float snr) {
     meshtastic::DataMsg dm;
     if (!meshtastic::decodeData(pt, ctLen, dm)) {
         Serial.println("[Meshtastic]   decrypt->protobuf undecodable (foreign key or non-Data), ignored");
+        logMeshRawLine(String("  from=!") + String(hdr.from, HEX) + " undecodable (foreign key/non-Data) pt=" +
+                       toHex(pt, ctLen));
         return;
     }
     Serial.printf("[Meshtastic]   decoded portnum=%u (%s) payloadLen=%u\n", (unsigned)dm.portnum,
                   portName(dm.portnum).c_str(), (unsigned)dm.payloadLen);
+    // Decode summary + decrypted Data payload bytes (so screen output can be
+    // correlated with exactly what was received/decrypted for this frame).
+    {
+        char meta[96];
+        snprintf(meta, sizeof(meta), "  from=!%08x id=0x%08x port=%u ptlen=%u payloadhex=", (unsigned)hdr.from,
+                 (unsigned)hdr.id, (unsigned)dm.portnum, (unsigned)dm.payloadLen);
+        logMeshRawLine(String(meta) + toHex(dm.payload, dm.payloadLen));
+    }
 
     // Any successfully-decoded frame proves a heard node on this channel.
     touchNode(hdr.from, rssi, snr);
@@ -341,9 +392,14 @@ void decodeMeshFrame(const uint8_t *buf, size_t len, float rssi, float snr) {
         // (mis-routed protobuf, wrong-key/collision garbage) is dropped here so it
         // never paints as symbols on screen nor lands in the SD log as garbage.
         String text;
-        if (!meshtastic::sanitizeDisplayText(dm.payload, dm.payloadLen, text) || text.length() == 0) {
+        bool okText = meshtastic::sanitizeDisplayText(dm.payload, dm.payloadLen, text);
+        if (!okText || text.length() == 0) {
             Serial.printf(
                 "[Meshtastic]   TEXT payload not displayable (binary/non-text), not shown or logged\n"
+            );
+            logMeshRawLine(
+                String("  TEXT DROPPED sanitize=") + (okText ? "ok-but-empty" : "rejected") +
+                " len=" + String((unsigned)text.length())
             );
             return;
         }
@@ -351,6 +407,9 @@ void decodeMeshFrame(const uint8_t *buf, size_t len, float rssi, float snr) {
         addConvMsg(hdr.from, false, text, rssi, snr);
         if (view == View::Conversation) needsRedraw = true;
         logMeshMsg("rx", hdr.from, nodeName(hdr.from), rssi, snr, text);
+        // Record the exact string handed to the display so an on-screen anomaly
+        // (e.g. a message rendering as ".") can be traced to its bytes.
+        logMeshRawLine(String("  TEXT SHOWN len=") + String((unsigned)text.length()) + " display=\"" + text + "\"");
         Serial.printf(
             "[Meshtastic]   >>> TEXT from !%08x: \"%s\" (rssi=%.0fdBm snr=%.1fdB)\n", (unsigned)hdr.from,
             text.c_str(), rssi, snr
@@ -380,19 +439,22 @@ uint32_t deriveNodeId() {
     return id;
 }
 
-// Compose -> encode Data -> encrypt -> frame -> duty-cycle guard -> transmit ->
-// re-arm RX. This is the ONLY transmit path; it runs only on explicit user
-// action (compose/send or a serial trigger), never in a loop. Returns true on
-// a successful transmit; false if empty, encode-failed, blocked, or radio error.
-bool sendMeshText(const String &text) {
-    if (!meshRadio || text.length() == 0) return false;
+// Core TX: encode Data(portnum,payload) -> AES-CTR encrypt with the LongFast key
+// -> prepend header (to=broadcast, from=us, channel=0x08) -> duty-cycle guard ->
+// half-duplex transmit -> re-arm RX. Shared by the text and self-NodeInfo paths.
+// `reportBlock` = true makes a duty-cycle refusal update the on-screen "TX blocked"
+// state (user messages); NodeInfo passes false so a background announce that gets
+// deferred doesn't surface as a user-facing block. Returns true on a completed
+// transmit; false if empty, encode-failed, blocked, or radio error. Runs only from
+// the main loop (user action or the periodic announce) — never from the RX ISR.
+bool txMeshData(uint32_t portnum, const uint8_t *payload, size_t payloadLen, bool reportBlock,
+                const char *label) {
+    if (!meshRadio) return false;
 
     uint8_t data[meshtastic::MAX_PLAINTEXT];
-    size_t dataLen =
-        meshtastic::encodeData(meshtastic::TEXT_MESSAGE_APP, (const uint8_t *)text.c_str(),
-                               text.length(), data, sizeof(data));
+    size_t dataLen = meshtastic::encodeData(portnum, payload, payloadLen, data, sizeof(data));
     if (dataLen == 0) {
-        Serial.println("[Meshtastic] TX: message too long to encode");
+        Serial.printf("[Meshtastic] TX(%s): payload too long to encode\n", label);
         return false;
     }
 
@@ -419,16 +481,18 @@ bool sendMeshText(const String &text) {
     uint32_t airMs = meshRadio->getTimeOnAir(frameLen) / 1000;
     if (dutyCycle.wouldExceed(now, airMs)) {
         uint32_t waitMs = dutyCycle.msUntilAvailable(now, airMs);
-        lastTxBlocked = true;
-        lastTxBlockedWaitS = (waitMs + 999) / 1000;
+        if (reportBlock) {
+            lastTxBlocked = true;
+            lastTxBlockedWaitS = (waitMs + 999) / 1000;
+        }
         Serial.printf(
-            "[Meshtastic] TX BLOCKED by duty cycle: pkt=%ums used=%ums/%ums budget, retry in ~%us\n",
-            (unsigned)airMs, (unsigned)dutyCycle.usedMs(now), (unsigned)dutyCycle.budgetMs,
-            (unsigned)lastTxBlockedWaitS
+            "[Meshtastic] TX(%s) BLOCKED by duty cycle: pkt=%ums used=%ums/%ums budget, retry in ~%us\n",
+            label, (unsigned)airMs, (unsigned)dutyCycle.usedMs(now), (unsigned)dutyCycle.budgetMs,
+            (unsigned)((waitMs + 999) / 1000)
         );
         return false;
     }
-    lastTxBlocked = false;
+    if (reportBlock) lastTxBlocked = false;
 
     // --- Transmit (half-duplex: mute RX IRQ, send, re-arm RX) ---
     txInProgress = true;
@@ -439,23 +503,50 @@ bool sendMeshText(const String &text) {
     txInProgress = false;
 
     if (st != RADIOLIB_ERR_NONE) {
-        Serial.printf("[Meshtastic] TX failed: %d\n", st);
+        Serial.printf("[Meshtastic] TX(%s) failed: %d\n", label, st);
         return false;
     }
 
     dutyCycle.record(now, airMs);
     meshTxCount++;
     lastTxAtMs = now;
-    // Show our own sent line in the conversation view.
+    Serial.printf(
+        "[Meshtastic] TX #%lu (%s) id=0x%08x len=%u airtime=%ums used=%ums/%ums\n",
+        (unsigned long)meshTxCount, label, (unsigned)id, (unsigned)frameLen, (unsigned)airMs,
+        (unsigned)dutyCycle.usedMs(now), (unsigned)dutyCycle.budgetMs
+    );
+    return true;
+}
+
+// Compose a text message and transmit it. The ONLY user-facing TX path; runs only
+// on explicit user action (compose/send or a serial trigger), never in a loop.
+bool sendMeshText(const String &text) {
+    if (text.length() == 0) return false;
+    if (!txMeshData(meshtastic::TEXT_MESSAGE_APP, (const uint8_t *)text.c_str(), text.length(), true,
+                    "text"))
+        return false;
+    // Show our own sent line in the conversation view and log it.
     addConvMsg(ourNodeId, true, text, 0, 0);
     needsRedraw = true;
     logMeshMsg("tx", ourNodeId, "", 0, 0, text);
-    Serial.printf(
-        "[Meshtastic] TX #%lu id=0x%08x len=%u airtime=%ums used=%ums/%ums \"%s\"\n",
-        (unsigned long)meshTxCount, (unsigned)id, (unsigned)frameLen, (unsigned)airMs,
-        (unsigned)dutyCycle.usedMs(now), (unsigned)dutyCycle.budgetMs, text.c_str()
-    );
+    Serial.printf("[Meshtastic]   sent text: \"%s\"\n", text.c_str());
     return true;
+}
+
+// Broadcast our own NodeInfo (User: id/long_name/short_name) so peers list us by
+// name rather than a bare !id. Duty-cycle guarded like any TX, but not surfaced as
+// a user "TX blocked" if deferred. Not shown in the conversation or SD log.
+void sendNodeInfo() {
+    if (!meshRadio) return;
+    char idStr[12];
+    snprintf(idStr, sizeof(idStr), "!%08x", (unsigned)ourNodeId);
+    uint8_t user[96];
+    size_t userLen = meshtastic::encodeUser(idStr, meshLongName, meshShortName, user, sizeof(user));
+    if (userLen == 0) return;
+    if (txMeshData(meshtastic::NODEINFO_APP, user, userLen, false, "nodeinfo"))
+        Serial.printf(
+            "[Meshtastic]   NodeInfo announced: %s \"%s\" / \"%s\"\n", idStr, meshLongName, meshShortName
+        );
 }
 
 // Reads one pending frame, logs it raw with RF metrics, decodes it, re-arms RX.
@@ -490,6 +581,18 @@ void processMeshRx() {
             (unsigned long)meshRxCount, (unsigned)len, rssi, snr, airtimeMs, crcOk ? "OK" : "MISMATCH",
             toHex(buf, len).c_str()
         );
+        // Raw frame line for the diagnostic log (full ciphertext hex). Only frames
+        // on our LongFast channel are logged, so the file isn't flooded with the
+        // ambient other-channel traffic that we'd skip anyway.
+        if (len >= meshtastic::HEADER_LEN && buf[13] == meshtastic::LONGFAST_CHANNEL_HASH) {
+            char meta[112];
+            snprintf(
+                meta, sizeof(meta), "RX #%lu clk=%s t=%lums rssi=%.1f snr=%.1f crc=%s len=%u hex=",
+                (unsigned long)meshRxCount, nowClock().c_str(), (unsigned long)millis(), rssi, snr,
+                crcOk ? "OK" : "MISMATCH", (unsigned)len
+            );
+            logMeshRawLine(String(meta) + toHex(buf, len));
+        }
         decodeMeshFrame(buf, len, rssi, snr);
     } else {
         Serial.printf("[Meshtastic] RX read failed: %d\n", state);
@@ -596,14 +699,15 @@ void drawConversation() {
         if (i < end && i < total) {
             const ConvMsg &m = convo[i];
             if (m.mine) {
-                drawBodyRow(slot, y, shortText(">> " + m.text, 50), bruceConfig.priColor, TFT_BLACK);
+                drawBodyRow(slot, y, m.clk + " >> " + shortText(m.text, 38), bruceConfig.priColor, TFT_BLACK);
             } else {
                 String who = nodeName(m.from);
                 if (who.length()) snprintf(meta, sizeof(meta), "%s: ", who.c_str());
                 else snprintf(meta, sizeof(meta), "!%08x: ", (unsigned)m.from);
                 char rf[24];
                 snprintf(rf, sizeof(rf), "  %.0f/%.0f", m.rssi, m.snr);
-                drawBodyRow(slot, y, shortText(String(meta) + m.text, 40) + rf, TFT_WHITE, TFT_BLACK);
+                drawBodyRow(slot, y, m.clk + " " + shortText(String(meta) + m.text, 30) + rf, TFT_WHITE,
+                            TFT_BLACK);
             }
         } else if (total == 0 && slot == 0) {
             drawBodyRow(slot, y, "  (no messages yet - SEL to compose)", TFT_DARKGREY, TFT_BLACK);
@@ -740,7 +844,14 @@ void meshtasticChannel() {
     // Expand the LongFast default channel key (PSK index 1) once.
     meshtastic::expandPsk(1, meshKey, meshKeyLen);
     ourNodeId = deriveNodeId();
-    Serial.printf("[Meshtastic] our node-ID: !%08x\n", (unsigned)ourNodeId);
+    // Derive display names from the node-ID (short = last 4 hex, à la Meshtastic
+    // defaults) so peers show a name without any extra config/storage.
+    snprintf(meshShortName, sizeof(meshShortName), "%04x", (unsigned)(ourNodeId & 0xFFFF));
+    snprintf(meshLongName, sizeof(meshLongName), "Bruce %s", meshShortName);
+    Serial.printf(
+        "[Meshtastic] our node-ID: !%08x name \"%s\"/\"%s\"\n", (unsigned)ourNodeId, meshLongName,
+        meshShortName
+    );
 
     // SD conversation logging (best-effort). Write a CSV header on first create.
     meshSdLog = false;
@@ -755,6 +866,14 @@ void meshtasticChannel() {
         }
     }
     if (!meshSdLog) Serial.println("[Meshtastic] SD log disabled (no card)");
+    else {
+        // Session marker in the raw diagnostic log so overnight runs are delimited.
+        char hdr[96];
+        snprintf(hdr, sizeof(hdr), "=== session open t=%lums node=!%08x LongFast/EU868 869.525MHz ===",
+                 (unsigned long)millis(), (unsigned)ourNodeId);
+        logMeshRawLine(hdr);
+        Serial.printf("[Meshtastic] raw RX log: %s\n", MESH_RAW_PATH);
+    }
 
     // Deterministic codec/crypto self-test (Appendix A) on every open, so a
     // regression is always visible before any radio traffic (mirrors recon).
@@ -792,6 +911,7 @@ void meshtasticChannel() {
 
     uint32_t lastHeartbeat = millis();
     uint32_t lastChromeTick = millis();
+    nextNodeInfoAtMs = millis() + NODEINFO_FIRST_MS; // announce ourselves shortly after open
 
     Serial.println("[Meshtastic] type a line on serial to transmit it as a text message");
     String serialLine;
@@ -822,6 +942,15 @@ void meshtasticChannel() {
                 "[Meshtastic] listening... frames=%lu tx=%lu uptime=%lus\n", (unsigned long)meshRxCount,
                 (unsigned long)meshTxCount, (unsigned long)(millis() / 1000)
             );
+        }
+
+        // Periodic self-NodeInfo broadcast so peers list us by name. Signed millis
+        // delta is wrap-safe; duty-cycle guarded inside sendNodeInfo(). Reschedule
+        // regardless so a duty-deferred announce simply waits for the next window.
+        if ((int32_t)(millis() - nextNodeInfoAtMs) >= 0) {
+            sendNodeInfo();
+            nextNodeInfoAtMs = millis() + NODEINFO_INTERVAL_MS;
+            needsRedraw = true;
         }
 
         // Refresh once a second so the duty-cycle % and node ages stay current

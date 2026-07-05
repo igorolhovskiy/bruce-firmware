@@ -79,6 +79,12 @@ void aesCtrCrypt(const uint8_t key[16], const uint8_t nonce[16], uint8_t *data, 
 // (length-delimited). Returns encoded length, or 0 on overflow.
 size_t encodeData(uint32_t portnum, const uint8_t *payload, size_t payloadLen, uint8_t *out, size_t outCap);
 
+// Minimal NODEINFO `User` protobuf: id (field 1), long_name (field 2), short_name
+// (field 3), all length-delimited strings. This is the payload carried inside a
+// Data{portnum=NODEINFO_APP}. Returns encoded length, or 0 on overflow. Symmetric
+// with decodeUserName (which reads fields 2 and 3).
+size_t encodeUser(const char *id, const char *longName, const char *shortName, uint8_t *out, size_t outCap);
+
 // Rolling-window airtime accounting for the EU868 10% duty-cycle limit. Pure
 // and testable (all timing is passed in). Window/budget default to 1 hour / 10%.
 struct DutyCycle {
@@ -120,9 +126,11 @@ bool decodeUserName(const uint8_t *buf, size_t len, char *longName, size_t longC
 
 // Validate that a decoded TEXT_MESSAGE_APP payload is genuinely displayable text
 // and build a render-safe string in `out`: printable ASCII is kept verbatim,
-// tab/newline/CR collapse to a single space, and every valid non-ASCII UTF-8
-// code point (emoji, accents, ...) becomes '?' since the device font can't render
-// it. Returns FALSE when the payload is not real text -- a C0 control byte (other
+// tab/newline/CR collapse to a single space, accented Latin letters and common
+// punctuation are transliterated to ASCII (é->e, à->a, «»->", …->..., °->dropped)
+// so EU mesh text stays readable, and any remaining non-ASCII code point (emoji,
+// CJK, ...) becomes '?' since the device font can't render it. Returns FALSE when
+// the payload is not real text -- a C0 control byte (other
 // than tab/newline/CR), DEL, or malformed UTF-8 -- which is how a mis-routed
 // protobuf (e.g. a NODEINFO User record) or wrong-key/collision garbage looks;
 // such frames must not be surfaced or logged as messages.

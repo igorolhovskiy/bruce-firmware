@@ -135,6 +135,33 @@ size_t encodeData(uint32_t portnum, const uint8_t *payload, size_t payloadLen, u
     return pos;
 }
 
+namespace {
+// Append one length-delimited string field (wire type 2) to `out`. Returns the
+// new position, or 0 on overflow. `tag` is the pre-computed field tag byte.
+size_t writeStringField(uint8_t *out, size_t cap, size_t pos, uint8_t tag, const char *s) {
+    if (s == nullptr) return pos;
+    size_t slen = strlen(s);
+    if (pos >= cap) return 0;
+    out[pos++] = tag;
+    pos = writeVarint(out, cap, pos, (uint32_t)slen);
+    if (pos == 0) return 0;
+    if (pos + slen > cap) return 0;
+    memcpy(out + pos, s, slen);
+    return pos + slen;
+}
+} // namespace
+
+size_t encodeUser(const char *id, const char *longName, const char *shortName, uint8_t *out, size_t outCap) {
+    size_t pos = 0;
+    pos = writeStringField(out, outCap, pos, 0x0a, id);        // field 1, wire 2
+    if (pos == 0) return 0;
+    pos = writeStringField(out, outCap, pos, 0x12, longName);  // field 2, wire 2
+    if (pos == 0) return 0;
+    pos = writeStringField(out, outCap, pos, 0x1a, shortName); // field 3, wire 2
+    if (pos == 0) return 0;
+    return pos;
+}
+
 bool decodeData(const uint8_t *buf, size_t len, DataMsg &out) {
     out.portnum = 0;
     out.payloadLen = 0;
@@ -230,6 +257,47 @@ bool decodeUserName(const uint8_t *buf, size_t len, char *longName, size_t longC
     return found;
 }
 
+namespace {
+// Fold a Unicode code point the device font can't render to a plain-ASCII
+// equivalent so accented text (common in EU mesh traffic) stays readable instead
+// of turning into '?'. Returns the replacement ("" means drop it), or nullptr if
+// there is no sensible ASCII form (emoji, CJK, ...) -> caller uses '?'.
+const char *asciiFold(uint32_t cp) {
+    switch (cp) {
+    case 0x00C0: case 0x00C1: case 0x00C2: case 0x00C3: case 0x00C4: case 0x00C5: return "A";
+    case 0x00C6: return "AE";
+    case 0x00C7: return "C";
+    case 0x00C8: case 0x00C9: case 0x00CA: case 0x00CB: return "E";
+    case 0x00CC: case 0x00CD: case 0x00CE: case 0x00CF: return "I";
+    case 0x00D1: return "N";
+    case 0x00D2: case 0x00D3: case 0x00D4: case 0x00D5: case 0x00D6: case 0x00D8: return "O";
+    case 0x00D9: case 0x00DA: case 0x00DB: case 0x00DC: return "U";
+    case 0x00DD: return "Y";
+    case 0x00DF: return "ss";
+    case 0x00E0: case 0x00E1: case 0x00E2: case 0x00E3: case 0x00E4: case 0x00E5: return "a";
+    case 0x00E6: return "ae";
+    case 0x00E7: return "c";
+    case 0x00E8: case 0x00E9: case 0x00EA: case 0x00EB: return "e";
+    case 0x00EC: case 0x00ED: case 0x00EE: case 0x00EF: return "i";
+    case 0x00F1: return "n";
+    case 0x00F2: case 0x00F3: case 0x00F4: case 0x00F5: case 0x00F6: case 0x00F8: return "o";
+    case 0x00F9: case 0x00FA: case 0x00FB: case 0x00FC: return "u";
+    case 0x00FD: case 0x00FF: return "y";
+    case 0x00D7: return "x";           // multiplication sign
+    case 0x00F7: return "/";           // division sign
+    case 0x00B0: return "";            // degree sign -> drop (e.g. "23.9C")
+    case 0x00A0: return " ";           // non-breaking space
+    case 0x00AB: case 0x00BB: return "\""; // guillemets
+    case 0x2018: case 0x2019: return "'";  // curly single quotes
+    case 0x201C: case 0x201D: return "\""; // curly double quotes
+    case 0x2013: case 0x2014: return "-";  // en/em dash
+    case 0x2026: return "...";         // ellipsis
+    case 0x20AC: return "EUR";         // euro sign
+    default: return nullptr;
+    }
+}
+} // namespace
+
 bool sanitizeDisplayText(const uint8_t *payload, size_t len, String &out) {
     out = "";
     out.reserve(len + 1);
@@ -255,7 +323,17 @@ bool sanitizeDisplayText(const uint8_t *payload, size_t len, String &out) {
             if (i + seqLen > len) return false; // truncated sequence
             for (size_t j = 1; j < seqLen; j++)
                 if ((payload[i + j] & 0xC0) != 0x80) return false; // bad continuation byte
-            out += '?'; // valid code point the device font can't render -> placeholder
+            // Decode the code point, then transliterate to ASCII when we can
+            // (accents -> base letter); fall back to '?' for the truly unrenderable.
+            uint32_t cp;
+            if (seqLen == 2) cp = ((uint32_t)(b & 0x1F) << 6) | (payload[i + 1] & 0x3F);
+            else if (seqLen == 3)
+                cp = ((uint32_t)(b & 0x0F) << 12) | ((uint32_t)(payload[i + 1] & 0x3F) << 6) |
+                     (payload[i + 2] & 0x3F);
+            else cp = 0x10000; // 4-byte (emoji etc.): no ASCII form
+            const char *rep = asciiFold(cp);
+            if (rep) out += rep;
+            else out += '?'; // valid code point the device font can't render -> placeholder
             i += seqLen;
         }
     }
@@ -483,6 +561,14 @@ bool runMeshtasticSelfTest() {
         const uint8_t bad[] = {0x12, 0x09, 'T', 'e', 's', 't'};
         char ln2[40], sn2[8];
         ok = ok && !decodeUserName(bad, sizeof(bad), ln2, sizeof(ln2), sn2, sizeof(sn2));
+        // encodeUser round-trips back through decodeUserName (self-NodeInfo TX path)
+        uint8_t enc[64];
+        size_t el = encodeUser("!deadbeef", "Bruce beef", "beef", enc, sizeof(enc));
+        char ln3[40], sn3[8];
+        ok = ok && el > 0 && decodeUserName(enc, el, ln3, sizeof(ln3), sn3, sizeof(sn3)) &&
+             strcmp(ln3, "Bruce beef") == 0 && strcmp(sn3, "beef") == 0;
+        // first bytes must be the id field (tag 0x0a, len 9) so stock nodes key it correctly
+        ok = ok && enc[0] == 0x0a && enc[1] == 0x09;
         logCase("nodeinfo name", ok);
         allOk &= ok;
     }
@@ -508,6 +594,11 @@ bool runMeshtasticSelfTest() {
         // newline/tab collapse to a space (stays one CSV line / one display row)
         String s5;
         ok = ok && sanitizeDisplayText((const uint8_t *)"a\nb\tc", 5, s5) && s5 == "a b c";
+        // accented UTF-8 transliterates to ASCII: "Météo à 23°C" -> "Meteo a 23C"
+        const uint8_t accent[] = {'M', 0xC3, 0xA9, 't', 0xC3, 0xA9, 'o', ' ', 0xC3,
+                                  0xA0, ' ', '2', '3', 0xC2, 0xB0, 'C'};
+        String s6;
+        ok = ok && sanitizeDisplayText(accent, sizeof(accent), s6) && s6 == "Meteo a 23C";
         logCase("text guard", ok);
         allOk &= ok;
     }

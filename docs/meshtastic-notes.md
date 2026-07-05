@@ -300,6 +300,53 @@ text ever reaches `logMeshMsg` now, so the CSV stays human-readable text (no bin
 New self-test case `text guard`. **Verified on hardware:** self-test PASSED 11/11 (adds `text guard`),
 flashed to `lilygo-t-deck-pro` (Flash 79.6% / RAM 39.0%), radio up clean.
 
+## Phase 11 — self-NodeInfo broadcast + crypto re-verification
+
+**Self-NodeInfo broadcast (so peers show a name).** Added `meshtastic::encodeUser(id, long, short)`
+to the codec (User protobuf: field1 id `0x0a`, field2 long_name `0x12`, field3 short_name `0x1a` —
+symmetric with the existing `decodeUserName` which reads f2/f3). New self-test case `nodeinfo name`
+now also round-trips `encodeUser` back through `decodeUserName` and asserts the leading id tag
+(`0a 09…`). In `Meshtastic.cpp` the Phase-5 send path was refactored into a shared `txMeshData(portnum,
+payload, len, reportBlock, label)` core (encode→encrypt→frame→duty-guard→transmit); `sendMeshText`
+and the new `sendNodeInfo()` both call it. Names derive from the node-ID at open (short = last 4 hex
+`%04x`, long = `Bruce <short>`) — no extra config/storage. `sendNodeInfo()` fires ~8 s after open then
+every 30 min (`NODEINFO_INTERVAL_MS`), wrap-safe signed-millis schedule, duty-cycle guarded, and passes
+`reportBlock=false` so a deferred announce never shows as a user "TX blocked". Builds clean on
+`lilygo-t-deck-pro` (Flash 89.0% OTA). **On-device + live-peer verification still pending** (same
+Phase-7 interop gap: needs a real node to confirm it appears named).
+
+**Encryption/decryption re-checked against current Meshtastic `master` (date 2026-07-04).** Re-read
+the upstream source and confirmed every constant is still exact: EU_868 `RDEF(869.4,869.65,10,0,27,…)`;
+LONG_FAST (wideLora=false) BW250/SF11/CR4:5; preamble 16; `syncWord 0x2b`; `setCRC(…CRC_ON)`;
+`PacketHeader` layout + flag masks (`0x07/0x08/0x10/0xE0`, shift 5); `defaultpsk` bytes
+`d4f1bb3a…6901`; hash `xorHash(name)^xorHash(psk)` → LongFast `0x08`; `initNonce` = packetId u64 LE @0,
+fromNode u32 LE @8, extraNonce @12 (0 for PSK), CTR `setCounterSize(4)`. The fork's TX (`initNonce(us,id)`
+→ AES-CTR) and RX (`initNonce(from,id)` → AES-CTR) are symmetric and match; mbedtls CTR stays
+byte-identical for our sizes (carry never reaches byte 11). No discrepancy found.
+
+## Phase 12 — overnight RX diagnosis + readability/timestamp fixes
+
+User reported received messages showing only "." on screen. Added an SD raw RX log
+(`/meshtastic_raw.log`: full ciphertext hex per frame + decrypted payload hex + the exact display
+string) and ran it overnight. **Finding: no decode bug.** `/ping`=`2F70696E67`, `oui`=`6F7569`,
+`pong 00:03:29` all decode exactly; the "." messages were literally single-dot transmissions from one
+node (`!f6fb4870`), heard over three hops. The real problem was readability: accented UTF-8 (French
+mesh traffic) was blanked to `?` — the weather bot's `Météo à Genève : … 23.9°C` rendered as
+`M?t?o ? Gen?ve … 23.9?C`.
+
+Fixes shipped:
+- **ASCII transliteration** in `sanitizeDisplayText` (`asciiFold`): Latin-1 accents → base letter
+  (é→e, à→a, ç→c, ß→ss, …), common punctuation (« » → ", curly quotes → ' / ", – — → -, … → ...,
+  € → EUR), ° dropped; only truly unrenderable code points (emoji/CJK, incl. all 4-byte) stay `?`.
+  Verified against the real overnight bytes → `Meteo a Geneve : Temperature : 23.9C …`. Self-test
+  `text guard` extended with the accent case.
+- **Per-message timestamp** on every conversation line: `HH:MM:SS` wall-clock at arrival, or
+  `+HH:MM:SS` device uptime when the clock isn't set yet (the '+' marks it relative). `ConvMsg.clk`
+  captured in `addConvMsg` via `nowClock()`; also stamped on each raw-log frame (`clk=`).
+- **Raw log kept but channel-filtered:** only LongFast-channel frames (`buf[13]==0x08`) are logged, so
+  the ~1400 foreign-channel frames/night are dropped; ~1 MB/night of ambient LongFast still accrues,
+  deletable anytime. (Candidate future toggle if it becomes a nuisance.)
+
 ## Open decisions / to relay to user
 - Base branch (main vs lora-recon) — §5.1.
 - **Antenna safety:** EU868 antenna MUST be attached before radio power; TX into a missing/mismatched
