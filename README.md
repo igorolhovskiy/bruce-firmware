@@ -52,7 +52,19 @@ Features developed in this fork, on top of stock Bruce. Each is T-Deck Plus only
   dictionary from SD, decode/display NDEF records, NTAG21x tools (signature, counter, password),
   a continuous UID logger (recon mode), and gen2/CUID magic-card clone with unbrick. The Grove I2C
   bus is routed to `Wire1` so the reader no longer conflicts with the keyboard on the shared bus.
-- **[BLE Tracker Detector](./docs/ble-tracker-detector-README.md)** — passive, receive-only scan (BLE → Tracker Detector) that classifies
+- **[Counter-Surveil ("Detector")](./docs/counter-surveillance-README.md)** — a new top-level app
+  (eye icon on the main menu) grouping passive, receive-only detectors for surveillance-capable radio
+  devices. Nothing transmits; each restores the prior WiFi/BLE mode on exit, mirrors to serial, and
+  logs raw sightings under `/BruceDetector/`. Includes: **WiFi Camera** (flags devices by camera-vendor
+  MAC OUI or camera-name SSID, H/M/L confidence); **Drone Remote ID** (decodes Open Drone ID / ASTM
+  F3411 over WiFi vendor-IE/NAN and BLE, listing drones with their position and **operator** location);
+  **Rogue AP / Karma** (many-SSIDs-per-BSSID Karma, evil-twin, deauth-flood); **BLE Spy Tags** (hidden
+  BLE cameras/doorbells/recorders via the shared vendor DB, device-name patterns, and company-ID);
+  **Follower Scan** (dwell-time model over WiFi-probe + BLE addresses; mark "I moved" to surface an
+  address that follows you); and the relocated Tracker Detector below. An **About / Limits** entry
+  states the hardware non-goals on-device.
+- **[Tracker Detector](./docs/ble-tracker-detector-README.md)** — passive, receive-only scan
+  (**now under Detector → Tracker Detector**, moved out of the BLE menu) that classifies
   advertisements as Apple Find My/AirTag, Tile, or Samsung SmartTag; builds a live per-device table
   of dwell time, hit count, last-seen age and RSSI (sort cycles with SEL); highlights persistent
   trackers (dwell ≥ 5 min) as potential followers; and logs every sighting to SD
@@ -135,8 +147,9 @@ These are inherited from upstream Bruce and available on the T-Deck Plus. See th
 - [x] Android Spam
 - [x] Spam All
 
-> This fork adds a passive **Tracker Detector**, **BLE scan name resolution**, expanded spam vectors,
-> and the **LED name badge sender** — see "What this fork adds" above.
+> This fork adds **BLE scan name resolution**, expanded spam vectors, and the **LED name badge
+> sender** — see "What this fork adds" above. The passive **Tracker Detector** moved to the new
+> **Counter-Surveil ("Detector")** app, alongside a **BLE Spy Tags** detector.
 </details>
 
 <details>
