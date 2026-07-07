@@ -1,6 +1,7 @@
 #include "CounterSurveilMenu.h"
 
 #include "core/display.h"
+#include "core/mykeyboard.h"
 #include "core/utils.h"
 #include "modules/ble/ble_spy_detector.h"
 #include "modules/ble/tracker_detector.h"
@@ -9,6 +10,41 @@
 #include "modules/wifi/rogue_ap.h"
 #include "modules/wifi/wifi_camera_detector.h"
 #include <globals.h>
+
+// About / Limits screen: states the passive nature and the hardware non-goals
+// on-device so the suite doesn't over-promise. Loops until ESC.
+static void counterSurveilAbout() {
+    const char *lines[] = {
+        "Counter-Surveil (Detector)",
+        "",
+        "All detectors are PASSIVE /",
+        "receive-only: never transmit,",
+        "beacon, deauth or associate.",
+        "",
+        "Cannot detect (hardware limits):",
+        "- cellular trackers / IMSI (no",
+        "  cellular modem)",
+        "- analog RF bugs / wireless mics",
+        "  (no broadband SDR)",
+        "- optical / lens-glint cameras",
+        "  (no optical sensor)",
+        "- Zigbee/Thread 802.15.4",
+        "",
+        "Hits are heuristic - see confidence.",
+        "Press ESC to go back.",
+    };
+    tft.fillScreen(bruceConfig.bgColor);
+    tft.setTextSize(FP);
+    int n = sizeof(lines) / sizeof(lines[0]);
+    for (int i = 0; i < n; i++) {
+        uint16_t fg = i == 0 ? bruceConfig.priColor
+                      : (lines[i][0] == '-' || lines[i][0] == ' ') ? TFT_WHITE
+                                                                   : TFT_YELLOW;
+        tft.setTextColor(fg, bruceConfig.bgColor);
+        tft.drawString(lines[i], 6, 4 + i * 12);
+    }
+    while (!check(EscPress)) delay(30);
+}
 
 void CounterSurveilMenu::optionsMenu() {
     options.clear();
@@ -20,6 +56,7 @@ void CounterSurveilMenu::optionsMenu() {
     options.push_back({"Rogue AP / Karma", rogue_ap});
     options.push_back({"BLE Spy Tags", ble_spy_detector});
     options.push_back({"Follower Scan", follower_scan});
+    options.push_back({"About / Limits", counterSurveilAbout});
 
     addOptionToMainMenu();
 
