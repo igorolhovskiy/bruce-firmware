@@ -7,6 +7,7 @@
 #include "menu_items/ClockMenu.h"
 #include "menu_items/ConfigMenu.h"
 #include "menu_items/ConnectMenu.h"
+#include "menu_items/CounterSurveilMenu.h"
 #include "menu_items/EthernetMenu.h"
 #include "menu_items/FMMenu.h"
 #include "menu_items/FileMenu.h"
@@ -36,6 +37,7 @@ public:
     ScriptsMenu scriptsMenu;
     WifiMenu wifiMenu;
 #if !defined(LITE_VERSION)
+    CounterSurveilMenu counterSurveilMenu;
     LoRaMenu loraMenu;
     EthernetMenu ethernetMenu;
 #endif

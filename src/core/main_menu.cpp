@@ -10,6 +10,7 @@ MainMenu::MainMenu() {
         &rfMenu,
         &nrf24Menu,
 #if !defined(LITE_VERSION)
+        &counterSurveilMenu,
         &loraMenu,
 #endif
 #if defined(FM_SI4713) && !defined(LITE_VERSION)
