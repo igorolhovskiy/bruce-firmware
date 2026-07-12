@@ -5,6 +5,7 @@
 #include "core/utils.h"
 #include "modules/ble/ble_spy_detector.h"
 #include "modules/ble/tracker_detector.h"
+#include "modules/wifi/blockack_detector.h"
 #include "modules/wifi/drone_remoteid.h"
 #include "modules/wifi/follower_scan.h"
 #include "modules/wifi/rogue_ap.h"
@@ -56,6 +57,7 @@ void CounterSurveilMenu::optionsMenu() {
     options.push_back({"Rogue AP / Karma", rogue_ap});
     options.push_back({"BLE Spy Tags", ble_spy_detector});
     options.push_back({"Follower Scan", follower_scan});
+    options.push_back({"Block-Ack DoS", blockack_detector});
     options.push_back({"About / Limits", counterSurveilAbout});
 
     addOptionToMainMenu();

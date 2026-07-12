@@ -4,6 +4,7 @@
 // https://github.com/justcallmekoko/ESP32Marauder/wiki/arduino-ide-setup But change the file in:
 // C:\Users\<YOur User>\AppData\Local\Arduino15\packages\m5stack\hardware\esp32\2.0.9
 #include "wifi_atks.h"
+#include "blockack_dos.h"
 #include "core/display.h"
 #include "core/main_menu.h"
 #include "core/mykeyboard.h"
@@ -287,6 +288,7 @@ void wifi_atk_menu() {
 #endif
         {"Beacon SPAM",  [=]() { beaconAttack(); }     },
         {"Deauth Flood", [=]() { deauthFloodAttack(); }},
+        {"Block-Ack DoS", [=]() { blockack_dos(); }    },
     };
     addOptionToMainMenu();
     loopOptions(options);
