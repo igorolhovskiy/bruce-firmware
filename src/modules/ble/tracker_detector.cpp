@@ -135,6 +135,8 @@ struct TrackerEnt {
     uint16_t count;
     uint32_t firstMs;
     uint32_t lastMs;
+    uint8_t payloadLen;   // last raw advertisement (for the detail "why" view)
+    uint8_t payload[31];
 };
 constexpr size_t TRACKER_MAX = 128;
 std::vector<TrackerEnt> trackers;
@@ -145,6 +147,8 @@ const char *sortName(uint8_t m) {
     return m == SORT_DURATION ? "seen-time" : m == SORT_LASTSEEN ? "last-seen" : "count";
 }
 int scroll = 0;
+int cursor = 0;          // selected row (index into the sorted display order)
+bool detailView = false; // showing the per-tracker detail page for `cursor`
 
 // A tracker seen for at least this long is flagged as a potential follower.
 constexpr uint32_t PERSIST_MS = 5UL * 60 * 1000;
@@ -198,6 +202,8 @@ void onSighting(const Sighting &s) {
             e.lastMs = s.atMs;
             if (e.count < 0xFFFF) e.count++;
             if (s.separated) e.separated = 1;
+            e.payloadLen = s.payloadLen;
+            memcpy(e.payload, s.payload, s.payloadLen);
             logSighting(s);
             return;
         }
@@ -215,6 +221,8 @@ void onSighting(const Sighting &s) {
     e.rssi = e.bestRssi = s.rssi;
     e.count = 1;
     e.firstMs = e.lastMs = s.atMs;
+    e.payloadLen = s.payloadLen;
+    memcpy(e.payload, s.payload, s.payloadLen);
     trackers.push_back(e);
     logSighting(s);
 }
@@ -289,7 +297,7 @@ void drawChrome() {
 }
 
 void drawFooter() {
-    String hint = "SEL sort  ^v scroll  <-exit";
+    String hint = detailView ? "<-/SEL back  ^v scroll" : "SEL details  ^v select  s sort  <-exit";
     if (footerCache == hint) return;
     footerCache = hint;
     tft.fillRect(0, tftHeight - FOOTER_H, tftWidth, FOOTER_H, TFT_BLACK);
@@ -298,21 +306,52 @@ void drawFooter() {
     tft.drawString(hint, 4, tftHeight - FOOTER_H + 1);
 }
 
-void drawBody() {
-    int rows = (tftHeight - CHROME_H - FOOTER_H) / ROW_H;
-    if (rows > MAX_ROWS) rows = MAX_ROWS;
+// Full product name for the detail header.
+const char *typeLongName(uint8_t t) {
+    switch (t) {
+    case TR_FINDMY: return "Apple Find My (AirTag)";
+    case TR_SMARTTAG: return "Samsung SmartTag";
+    case TR_TILE: return "Tile";
+    default: return "Unknown tracker";
+    }
+}
 
-    std::vector<int> idx(trackers.size());
+// The advertisement signature that classified this tracker (the "why").
+const char *typeSignature(uint8_t t) {
+    switch (t) {
+    case TR_FINDMY: return "Apple mfg-data 4C00, type 0x12";
+    case TR_SMARTTAG: return "service UUID 0xFD5A";
+    case TR_TILE: return "service UUID 0xFEED/0xFEEC";
+    default: return "-";
+    }
+}
+
+// Build the sorted display order (shared by table + detail so `cursor` maps to
+// the same tracker in both).
+void buildTrackerOrder(std::vector<int> &idx) {
+    idx.resize(trackers.size());
     for (size_t i = 0; i < trackers.size(); i++) idx[i] = (int)i;
-    uint32_t now = millis();
     std::sort(idx.begin(), idx.end(), [&](int a, int b) {
         const TrackerEnt &A = trackers[a], &B = trackers[b];
         if (sortMode == SORT_DURATION) return (A.lastMs - A.firstMs) > (B.lastMs - B.firstMs);
         if (sortMode == SORT_LASTSEEN) return A.lastMs > B.lastMs;
         return A.count > B.count;
     });
+}
+
+void drawBody() {
+    int rows = (tftHeight - CHROME_H - FOOTER_H) / ROW_H;
+    if (rows > MAX_ROWS) rows = MAX_ROWS;
+
+    std::vector<int> idx;
+    buildTrackerOrder(idx);
+    uint32_t now = millis();
 
     int total = (int)idx.size();
+    if (cursor >= total) cursor = total ? total - 1 : 0;
+    if (cursor < 0) cursor = 0;
+    if (cursor < scroll) scroll = cursor;
+    if (cursor >= scroll + rows) scroll = cursor - rows + 1;
     int maxScroll = total - rows;
     if (maxScroll < 0) maxScroll = 0;
     if (scroll > maxScroll) scroll = maxScroll;
@@ -328,14 +367,67 @@ void drawBody() {
         }
         const TrackerEnt &e = trackers[idx[li]];
         uint32_t dur = e.lastMs - e.firstMs;
-        // type (+! if Apple separated), MAC tail, dwell time, count, last-seen ago, rssi
+        // cursor, type (+! if Apple separated), MAC tail, dwell time, count, last-seen ago, rssi
         String tail = String(e.addr).substring(9); // last 3 octets "cc:dd:ee"... keep short
-        String line = String(typeName(e.type)) + (e.separated ? "!" : " ") + " " + tail + "  " +
-                      fmtSpan(dur) + " x" + String(e.count) + " " + fmtSpan(now - e.lastMs) + " " +
-                      String(e.rssi);
-        uint16_t fg = (dur >= PERSIST_MS) ? TFT_RED : (e.separated ? TFT_YELLOW : TFT_WHITE);
+        String line = String(li == cursor ? '>' : ' ') + String(typeName(e.type)) +
+                      (e.separated ? "!" : " ") + " " + tail + "  " + fmtSpan(dur) + " x" +
+                      String(e.count) + " " + fmtSpan(now - e.lastMs) + " " + String(e.rssi);
+        uint16_t fg = li == cursor        ? TFT_CYAN
+                      : (dur >= PERSIST_MS) ? TFT_RED
+                      : (e.separated)       ? TFT_YELLOW
+                                            : TFT_WHITE;
         drawRow(slot, y, line, fg);
     }
+}
+
+// Per-tracker detail page: full BLE address, the recognised product, the exact
+// advertisement signature that matched (the "why"), dwell stats and the raw
+// advertisement bytes. Also states the address-rotation caveat.
+void drawDetail() {
+    std::vector<int> idx;
+    buildTrackerOrder(idx);
+    if (idx.empty()) {
+        drawRow(0, CHROME_H, "  (no tracker selected)", TFT_DARKGREY);
+        for (int s = 1; s < MAX_ROWS; s++) drawRow(s, CHROME_H + s * ROW_H, "", TFT_WHITE);
+        return;
+    }
+    if (cursor >= (int)idx.size()) cursor = idx.size() - 1;
+    if (cursor < 0) cursor = 0;
+    const TrackerEnt &e = trackers[idx[cursor]];
+    uint32_t now = millis();
+
+    String lines[MAX_ROWS];
+    uint16_t fgs[MAX_ROWS];
+    for (int i = 0; i < MAX_ROWS; i++) { lines[i] = ""; fgs[i] = TFT_WHITE; }
+    int n = 0;
+    bool persistent = (e.lastMs - e.firstMs) >= PERSIST_MS;
+
+    lines[n] = String("Addr: ") + e.addr; fgs[n++] = TFT_WHITE;
+    lines[n] = String("Type: ") + typeLongName(e.type); fgs[n++] = TFT_CYAN;
+    if (e.type == TR_FINDMY) {
+        lines[n] = String("State: ") + (e.separated ? "SEPARATED from owner" : "with owner");
+        fgs[n++] = e.separated ? TFT_YELLOW : TFT_WHITE;
+    }
+    lines[n] = String("RSSI: ") + e.rssi + " (best " + e.bestRssi + ")"; fgs[n++] = TFT_WHITE;
+    lines[n] = String("Seen x") + e.count + "  dwell " + fmtSpan(e.lastMs - e.firstMs); fgs[n++] = TFT_WHITE;
+    lines[n] = String("Last seen ") + fmtSpan(now - e.lastMs) + " ago"; fgs[n++] = TFT_WHITE;
+    lines[n] = String("Following: ") + (persistent ? "YES (>5 min dwell)" : "not yet");
+    fgs[n++] = persistent ? TFT_RED : TFT_GREEN;
+    lines[n] = ""; fgs[n++] = TFT_WHITE;
+    lines[n] = "Why flagged:"; fgs[n++] = bruceConfig.priColor;
+    lines[n] = String("- ") + typeSignature(e.type); fgs[n++] = TFT_WHITE;
+    if (e.type == TR_FINDMY && e.separated)
+        lines[n] = "- long frame = separated tag"; else lines[n] = "";
+    fgs[n++] = TFT_WHITE;
+    // Raw advertisement bytes (first 20 for width), then the rotation caveat.
+    if (e.payloadLen) {
+        uint8_t shown = e.payloadLen > 20 ? 20 : e.payloadLen;
+        lines[n] = String("Adv: ") + toHex(e.payload, shown); fgs[n++] = TFT_DARKGREY;
+    }
+    lines[n] = "Note: BLE addr rotates ~15min"; fgs[n++] = TFT_DARKGREY;
+
+    for (int slot = 0; slot < MAX_ROWS; slot++)
+        drawRow(slot, CHROME_H + slot * ROW_H, lines[slot], fgs[slot]);
 }
 
 void trackerDraw() {
@@ -345,7 +437,8 @@ void trackerDraw() {
         fullClear = false;
     }
     drawChrome();
-    drawBody();
+    if (detailView) drawDetail();
+    else drawBody();
     drawFooter();
 }
 
@@ -359,6 +452,8 @@ void tracker_detector() {
     ringDropped = 0;
     sortMode = SORT_DURATION;
     scroll = 0;
+    cursor = 0;
+    detailView = false;
     fullClear = true;
 
     // SD logging (best-effort). Write header on first create.
@@ -387,17 +482,35 @@ void tracker_detector() {
 
     trackerDraw();
 
-    while (!check(EscPress)) {
+    while (true) {
         Sighting s;
         int drained = 0;
         while (drained++ < 32 && ringPop(s)) onSighting(s);
 
+        // ESC: in the detail page, go back to the list; in the list, exit.
+        if (check(EscPress)) {
+            if (detailView) {
+                detailView = false;
+                fullClear = true;
+            } else break;
+        }
         if (check(SelPress)) {
+            if (detailView) detailView = false;
+            else if (!trackers.empty()) detailView = true;
+            fullClear = true;
+        }
+        if (check(PrevPress)) {
+            if (!detailView && cursor > 0) cursor--;
+        }
+        if (check(NextPress)) {
+            if (!detailView) cursor++;
+        }
+        char c = checkLetterShortcutPress();
+        if (c == 's' || c == 'S') {
             sortMode = (SortMode)((sortMode + 1) % 3);
+            cursor = 0;
             scroll = 0;
         }
-        if (check(PrevPress) && scroll > 0) scroll--;
-        if (check(NextPress)) scroll++;
 
         trackerDraw();
         delay(20);

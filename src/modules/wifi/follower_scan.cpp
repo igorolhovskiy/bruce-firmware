@@ -111,6 +111,8 @@ struct SeenEnt {
 constexpr size_t SEEN_MAX = 256;
 std::vector<SeenEnt> seen;
 int scroll = 0;
+int cursor = 0;          // selected row (index into the sorted display order)
+bool detailView = false; // showing the per-address detail page for `cursor`
 
 bool moveMarked = false;
 uint32_t moveMs = 0;
@@ -257,7 +259,8 @@ void drawChrome() {
     }
 }
 void drawFooter() {
-    String hint = "SEL 'I moved'  m mode  ^v scroll  <-exit";
+    String hint = detailView ? "<-/SEL back  ^v scroll"
+                             : "SEL details  ^v select  i moved  m mode  <-exit";
     if (footerCache == hint) return;
     footerCache = hint;
     tft.fillRect(0, tftHeight - FOOTER_H, tftWidth, FOOTER_H, TFT_BLACK);
@@ -265,15 +268,27 @@ void drawFooter() {
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
     tft.drawString(hint, 4, tftHeight - FOOTER_H + 1);
 }
+
+// Build the score-sorted display order (shared by table + detail so `cursor`
+// maps to the same address in both).
+void buildSeenOrder(std::vector<int> &idx) {
+    idx.resize(seen.size());
+    for (size_t i = 0; i < seen.size(); i++) idx[i] = (int)i;
+    std::sort(idx.begin(), idx.end(), [&](int a, int b) { return score(seen[a]) > score(seen[b]); });
+}
+
 void drawBody() {
     int rows = (tftHeight - CHROME_H - FOOTER_H) / ROW_H;
     if (rows > MAX_ROWS) rows = MAX_ROWS;
 
-    std::vector<int> idx(seen.size());
-    for (size_t i = 0; i < seen.size(); i++) idx[i] = (int)i;
-    std::sort(idx.begin(), idx.end(), [&](int a, int b) { return score(seen[a]) > score(seen[b]); });
+    std::vector<int> idx;
+    buildSeenOrder(idx);
 
     int total = (int)idx.size();
+    if (cursor >= total) cursor = total ? total - 1 : 0;
+    if (cursor < 0) cursor = 0;
+    if (cursor < scroll) scroll = cursor;
+    if (cursor >= scroll + rows) scroll = cursor - rows + 1;
     int maxScroll = total - rows;
     if (maxScroll < 0) maxScroll = 0;
     if (scroll > maxScroll) scroll = maxScroll;
@@ -291,13 +306,59 @@ void drawBody() {
         const SeenEnt &e = seen[idx[li]];
         bool crossed = e.beforeMove && e.afterMove;
         String flags = String(crossed ? "M" : "-") + (e.randomized ? "r" : "-");
-        String line = String(srcTag(e.src)) + " " + macTail(e.addr) + " " + fmtSpan(e.lastMs - e.firstMs) +
-                      " x" + String(e.count) + " " + String(e.rssi) + " " + flags + " " +
-                      fmtSpan(now - e.lastMs);
-        uint16_t fg = crossed ? TFT_RED : (e.randomized ? TFT_DARKGREY : TFT_WHITE);
+        String line = String(li == cursor ? '>' : ' ') + String(srcTag(e.src)) + " " + macTail(e.addr) +
+                      " " + fmtSpan(e.lastMs - e.firstMs) + " x" + String(e.count) + " " +
+                      String(e.rssi) + " " + flags + " " + fmtSpan(now - e.lastMs);
+        uint16_t fg = li == cursor ? TFT_CYAN : crossed ? TFT_RED : (e.randomized ? TFT_DARKGREY : TFT_WHITE);
         drawRow(slot, y, line, fg);
     }
 }
+
+// Per-address detail page: full address, transport, dwell/RSSI trend, the move-
+// crossing status and a plain-language reason for its follower ranking.
+void drawDetail() {
+    std::vector<int> idx;
+    buildSeenOrder(idx);
+    if (idx.empty()) {
+        drawRow(0, CHROME_H, "  (no address selected)", TFT_DARKGREY);
+        for (int s = 1; s < MAX_ROWS; s++) drawRow(s, CHROME_H + s * ROW_H, "", TFT_WHITE);
+        return;
+    }
+    if (cursor >= (int)idx.size()) cursor = idx.size() - 1;
+    if (cursor < 0) cursor = 0;
+    const SeenEnt &e = seen[idx[cursor]];
+    uint32_t now = millis();
+    bool crossed = e.beforeMove && e.afterMove;
+    int trend = e.rssi - e.firstRssi; // + = approaching
+
+    String lines[MAX_ROWS];
+    uint16_t fgs[MAX_ROWS];
+    for (int i = 0; i < MAX_ROWS; i++) { lines[i] = ""; fgs[i] = TFT_WHITE; }
+    int n = 0;
+
+    lines[n] = String("Addr: ") + e.addr; fgs[n++] = TFT_WHITE;
+    lines[n] = String("Transport: ") + (e.src == SRC_WIFI ? "WiFi probe req" : "BLE advertiser");
+    fgs[n++] = TFT_WHITE;
+    lines[n] = String("Addr kind: ") + (e.randomized ? "randomized" : "fixed"); fgs[n++] = e.randomized ? TFT_DARKGREY : TFT_WHITE;
+    lines[n] = String("Dwell: ") + fmtSpan(e.lastMs - e.firstMs) + "  seen x" + String(e.count); fgs[n++] = TFT_WHITE;
+    lines[n] = String("Last seen ") + fmtSpan(now - e.lastMs) + " ago"; fgs[n++] = TFT_WHITE;
+    lines[n] = String("RSSI: ") + e.rssi + "  best " + e.bestRssi + "  first " + e.firstRssi; fgs[n++] = TFT_WHITE;
+    lines[n] = String("Trend: ") + (trend > 3 ? "approaching" : trend < -3 ? "receding" : "steady");
+    fgs[n++] = trend > 3 ? TFT_RED : TFT_WHITE;
+    lines[n] = String("Move crossing: ") + (crossed ? "YES" : e.beforeMove ? "before only" : "-");
+    fgs[n++] = crossed ? TFT_RED : TFT_WHITE;
+    lines[n] = String("Follower score: ") + score(e); fgs[n++] = TFT_CYAN;
+    lines[n] = ""; fgs[n++] = TFT_WHITE;
+    lines[n] = "Why ranked here:"; fgs[n++] = bruceConfig.priColor;
+    if (crossed) { lines[n] = "- SEEN ACROSS YOUR MOVE"; fgs[n++] = TFT_RED; }
+    lines[n] = String("- dwell ") + fmtSpan(e.lastMs - e.firstMs) + ", x" + String(e.count) + " sightings";
+    fgs[n++] = TFT_WHITE;
+    if (e.randomized) { lines[n] = "- randomized addr: down-weighted"; fgs[n++] = TFT_DARKGREY; }
+
+    for (int slot = 0; slot < MAX_ROWS; slot++)
+        drawRow(slot, CHROME_H + slot * ROW_H, lines[slot], fgs[slot]);
+}
+
 void followDraw() {
     if (fullClear) {
         tft.fillScreen(TFT_BLACK);
@@ -305,7 +366,8 @@ void followDraw() {
         fullClear = false;
     }
     drawChrome();
-    drawBody();
+    if (detailView) drawDetail();
+    else drawBody();
     drawFooter();
 }
 
@@ -359,6 +421,8 @@ void follower_scan() {
     seen.clear();
     ringHead = ringTail = ringDropped = 0;
     scroll = 0;
+    cursor = 0;
+    detailView = false;
     moveMarked = false;
     moveCount = 0;
     fullClear = true;
@@ -383,7 +447,7 @@ void follower_scan() {
     startWifi();
     followDraw();
 
-    while (!check(EscPress)) {
+    while (true) {
         SeenEvent ev;
         int drained = 0;
         while (drained++ < 64 && ringPop(ev)) onSeen(ev);
@@ -393,10 +457,26 @@ void follower_scan() {
             hopChannel();
         }
 
-        if (check(SelPress)) markMove();
-        if (check(PrevPress) && scroll > 0) scroll--;
-        if (check(NextPress)) scroll++;
+        // ESC: in the detail page, go back to the list; in the list, exit.
+        if (check(EscPress)) {
+            if (detailView) {
+                detailView = false;
+                fullClear = true;
+            } else break;
+        }
+        if (check(SelPress)) {
+            if (detailView) detailView = false;
+            else if (!seen.empty()) detailView = true;
+            fullClear = true;
+        }
+        if (check(PrevPress)) {
+            if (!detailView && cursor > 0) cursor--;
+        }
+        if (check(NextPress)) {
+            if (!detailView) cursor++;
+        }
         char c = checkLetterShortcutPress();
+        if (c == 'i' || c == 'I') markMove(); // "I moved" mark (was SEL)
         if (c == 'm' || c == 'M') {
             if (mode == MODE_WIFI) {
                 stopWifi();

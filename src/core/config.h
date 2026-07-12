@@ -97,6 +97,16 @@ public:
 
     std::vector<String> disabledMenus = {};
 
+    // Counter-Surveillance (Detector app) — WiFi Camera Detector.
+    // Case-insensitive SSID substrings that flag a WiFi device as a possible camera.
+    // Editable via bruce.conf ("camSsidPatterns"); intentionally not exposed in the GUI.
+    // An empty list disables SSID-based flagging (OUI-based flagging still applies).
+    std::vector<String> camSsidPatterns = {
+        "IPC-",     "IPCAM", "HIK",   "Wyze",   "Reolink", "Dahua", "Amcrest", "Ezviz",
+        "Tapo",     "Foscam", "V380",  "Yi-",    "Insta360", "Arlo", "Blink",   "Ring",
+        "Nest",     "Camera", "-CAM",  "CAM-",   "Webcam",  "Doorbell",
+    };
+
     std::vector<QrCodeEntry> qrCodes = {
         {"Bruce AP",   "WIFI:T:WPA;S:BruceNet;P:brucenet;;"},
         {"Bruce Wiki", "https://github.com/pr3y/Bruce/wiki"},

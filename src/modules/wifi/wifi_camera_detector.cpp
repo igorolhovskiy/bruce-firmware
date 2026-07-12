@@ -31,14 +31,10 @@ constexpr uint8_t VIA_SSID = 0x02;
 
 const char *confName(uint8_t c) { return c == CONF_HIGH ? "HIGH" : c == CONF_MED ? "MED" : "LOW"; }
 
-// Camera-name SSID substrings (case-insensitive). Deliberately broad; a bare
-// generic-OUI match on one of these only yields LOW confidence.
-const char *CAM_SSID_PATTERNS[] = {
-    "IPC-",  "IPCAM",   "HIK",    "Wyze",  "Reolink", "Dahua", "Amcrest", "Ezviz",
-    "Tapo",  "Foscam",  "V380",   "Yi-",   "Insta360", "Arlo", "Blink",   "Ring",
-    "Nest",  "Camera",  "-CAM",   "CAM-",  "Webcam",  "Doorbell",
-};
-constexpr size_t N_PATTERNS = sizeof(CAM_SSID_PATTERNS) / sizeof(CAM_SSID_PATTERNS[0]);
+// Camera-name SSID substrings (case-insensitive) are sourced from
+// bruceConfig.camSsidPatterns (editable in bruce.conf, seeded with sane defaults).
+// Deliberately broad; a bare generic-OUI match on one of these only yields LOW
+// confidence.
 
 bool ciContains(const char *hay, const char *needle) {
     if (!hay || !needle || !*needle) return false;
@@ -55,8 +51,8 @@ bool ciContains(const char *hay, const char *needle) {
 
 bool ssidMatchesCamera(const char *ssid) {
     if (!ssid || !ssid[0]) return false;
-    for (size_t i = 0; i < N_PATTERNS; i++)
-        if (ciContains(ssid, CAM_SSID_PATTERNS[i])) return true;
+    for (const auto &pat : bruceConfig.camSsidPatterns)
+        if (ciContains(ssid, pat.c_str())) return true;
     return false;
 }
 
@@ -212,6 +208,8 @@ const char *sortName(uint8_t m) {
     return m == SORT_RSSI ? "signal" : m == SORT_LASTSEEN ? "last-seen" : "count";
 }
 int scroll = 0;
+int cursor = 0;        // selected row (index into the sorted display order)
+bool detailView = false; // showing the per-camera detail page for `cursor`
 
 // Channel hop state.
 size_t chIdx = 0;
@@ -372,7 +370,7 @@ void drawChrome() {
 }
 
 void drawFooter() {
-    String hint = "SEL sort  ^v scroll  l lock  <-exit";
+    String hint = detailView ? "<-/SEL back  ^v scroll" : "SEL details  ^v select  s sort  l lock  <-exit";
     if (footerCache == hint) return;
     footerCache = hint;
     tft.fillRect(0, tftHeight - FOOTER_H, tftWidth, FOOTER_H, TFT_BLACK);
@@ -381,11 +379,18 @@ void drawFooter() {
     tft.drawString(hint, 4, tftHeight - FOOTER_H + 1);
 }
 
-void drawBody() {
-    int rows = (tftHeight - CHROME_H - FOOTER_H) / ROW_H;
-    if (rows > MAX_ROWS) rows = MAX_ROWS;
+// Short "N units ago" / span formatter for the detail page.
+String fmtSpan(uint32_t ms) {
+    uint32_t s = ms / 1000;
+    if (s < 60) return String(s) + "s";
+    if (s < 3600) return String(s / 60) + "m" + String(s % 60) + "s";
+    return String(s / 3600) + "h" + String((s % 3600) / 60) + "m";
+}
 
-    std::vector<int> idx(cams.size());
+// Build the sorted display order (shared by table + detail so `cursor` maps to
+// the same camera in both).
+void buildCamOrder(std::vector<int> &idx) {
+    idx.resize(cams.size());
     for (size_t i = 0; i < cams.size(); i++) idx[i] = (int)i;
     std::sort(idx.begin(), idx.end(), [&](int a, int b) {
         const CamEnt &A = cams[a], &B = cams[b];
@@ -393,8 +398,20 @@ void drawBody() {
         if (sortMode == SORT_LASTSEEN) return A.lastMs > B.lastMs;
         return A.count > B.count;
     });
+}
+
+void drawBody() {
+    int rows = (tftHeight - CHROME_H - FOOTER_H) / ROW_H;
+    if (rows > MAX_ROWS) rows = MAX_ROWS;
+
+    std::vector<int> idx;
+    buildCamOrder(idx);
 
     int total = (int)idx.size();
+    if (cursor >= total) cursor = total ? total - 1 : 0;
+    if (cursor < 0) cursor = 0;
+    if (cursor < scroll) scroll = cursor;
+    if (cursor >= scroll + rows) scroll = cursor - rows + 1;
     int maxScroll = total - rows;
     if (maxScroll < 0) maxScroll = 0;
     if (scroll > maxScroll) scroll = maxScroll;
@@ -414,13 +431,74 @@ void drawBody() {
         String ven = String(c.vendor);
         if (ven.length() > 9) ven = ven.substring(0, 9);
         String name = c.ssid[0] ? String(c.ssid) : String("<hidden>");
-        if (name.length() > 12) name = name.substring(0, 12);
+        if (name.length() > 11) name = name.substring(0, 11);
         String macTail = macStr(c.mac).substring(9); // last 3 octets
-        String line = String(cflag) + " " + ven + " " + name + " c" + String(c.ch) + " " +
-                      String(c.rssi) + " x" + String(c.count) + " " + macTail;
-        uint16_t fg = c.conf == CONF_HIGH ? TFT_RED : c.conf == CONF_MED ? TFT_YELLOW : TFT_DARKGREY;
+        String line = String(li == cursor ? '>' : ' ') + String(cflag) + " " + ven + " " + name +
+                      " c" + String(c.ch) + " " + String(c.rssi) + " x" + String(c.count) + " " + macTail;
+        uint16_t fg = li == cursor ? TFT_CYAN
+                      : c.conf == CONF_HIGH ? TFT_RED
+                      : c.conf == CONF_MED  ? TFT_YELLOW
+                                            : TFT_DARKGREY;
         drawRow(slot, y, line, fg);
     }
+}
+
+// Per-camera detail page: full MAC, guessed vendor from the OUI table, and a
+// plain-language explanation of *why* this device was flagged (which signal(s)
+// fired and how they set the confidence).
+void drawDetail() {
+    std::vector<int> idx;
+    buildCamOrder(idx);
+    if (idx.empty()) {
+        drawRow(0, CHROME_H, "  (no camera selected)", TFT_DARKGREY);
+        for (int s = 1; s < MAX_ROWS; s++) drawRow(s, CHROME_H + s * ROW_H, "", TFT_WHITE);
+        return;
+    }
+    if (cursor >= (int)idx.size()) cursor = idx.size() - 1;
+    if (cursor < 0) cursor = 0;
+    const CamEnt &c = cams[idx[cursor]];
+
+    char ouiPfx[9];
+    snprintf(ouiPfx, sizeof(ouiPfx), "%02X:%02X:%02X", c.mac[0], c.mac[1], c.mac[2]);
+
+    String lines[MAX_ROWS];
+    uint16_t fgs[MAX_ROWS];
+    for (int i = 0; i < MAX_ROWS; i++) { lines[i] = ""; fgs[i] = TFT_WHITE; }
+    int n = 0;
+    uint16_t confFg = c.conf == CONF_HIGH ? TFT_RED : c.conf == CONF_MED ? TFT_YELLOW : TFT_DARKGREY;
+
+    lines[n] = String("MAC: ") + macStr(c.mac); fgs[n++] = TFT_WHITE;
+    lines[n] = String("Vendor: ") + c.vendor; fgs[n++] = TFT_CYAN;
+    lines[n] = String("OUI ") + ouiPfx + "  class: " + ouiClassName(c.klass); fgs[n++] = TFT_WHITE;
+    lines[n] = String("SSID: ") + (c.ssid[0] ? String(c.ssid) : String("<hidden>")); fgs[n++] = TFT_WHITE;
+    lines[n] = String("Channel: ") + c.ch + "   RSSI: " + c.rssi + " (best " + c.bestRssi + ")";
+    fgs[n++] = TFT_WHITE;
+    lines[n] = String("Seen x") + c.count + "  first " + fmtSpan(millis() - c.firstMs) + " ago";
+    fgs[n++] = TFT_WHITE;
+    lines[n] = String("Last seen ") + fmtSpan(millis() - c.lastMs) + " ago"; fgs[n++] = TFT_WHITE;
+    lines[n] = String("Confidence: ") + confName(c.conf); fgs[n++] = confFg;
+    lines[n] = ""; fgs[n++] = TFT_WHITE;
+    lines[n] = "Why flagged:"; fgs[n++] = bruceConfig.priColor;
+    if (c.via & VIA_OUI) {
+        lines[n] = String("- OUI ") + ouiPfx + " = " + c.vendor;
+        fgs[n++] = TFT_WHITE;
+        lines[n] = String("  (") +
+                   (c.klass == OUI_CAM ? "known camera vendor)"
+                    : c.klass == OUI_IOT ? "IoT/surveil vendor)"
+                    : c.klass == OUI_GENERIC ? "generic Wi-Fi module)"
+                                             : "vendor prefix)");
+        fgs[n++] = TFT_WHITE;
+    }
+    if (c.via & VIA_SSID) {
+        lines[n] = "- SSID matches a camera name"; fgs[n++] = TFT_WHITE;
+        lines[n] = "  pattern (IPC-/Wyze/Reolink..)"; fgs[n++] = TFT_WHITE;
+    }
+    if (c.conf == CONF_LOW) {
+        lines[n] = "Low: generic module + name only"; fgs[n++] = TFT_DARKGREY;
+    }
+
+    for (int slot = 0; slot < MAX_ROWS; slot++)
+        drawRow(slot, CHROME_H + slot * ROW_H, lines[slot], fgs[slot]);
 }
 
 void camDraw() {
@@ -430,7 +508,8 @@ void camDraw() {
         fullClear = false;
     }
     drawChrome();
-    drawBody();
+    if (detailView) drawDetail();
+    else drawBody();
     drawFooter();
 }
 
@@ -462,6 +541,8 @@ void wifi_camera_detector() {
     cbFrames = cbHits = 0;
     sortMode = SORT_RSSI;
     scroll = 0;
+    cursor = 0;
+    detailView = false;
     chIdx = 0;
     chLocked = false;
     fullClear = true;
@@ -496,7 +577,7 @@ void wifi_camera_detector() {
     camDraw();
     lastHopMs = millis();
 
-    while (!check(EscPress)) {
+    while (true) {
         CamEvent e;
         int drained = 0;
         while (drained++ < 64 && ringPop(e)) onCam(e);
@@ -506,13 +587,32 @@ void wifi_camera_detector() {
             hopChannel();
         }
 
+        // ESC: in the detail page, go back to the list; in the list, exit.
+        if (check(EscPress)) {
+            if (detailView) {
+                detailView = false;
+                fullClear = true;
+            } else break;
+        }
         if (check(SelPress)) {
+            // Open the detail page for the selected row, or close it if open.
+            if (detailView) detailView = false;
+            else if (!cams.empty()) detailView = true;
+            fullClear = true;
+        }
+        if (check(PrevPress)) {
+            if (detailView) { /* single camera view */ }
+            else if (cursor > 0) cursor--;
+        }
+        if (check(NextPress)) {
+            if (!detailView) cursor++;
+        }
+        char ch = checkLetterShortcutPress();
+        if (ch == 's' || ch == 'S') {
             sortMode = (SortMode)((sortMode + 1) % 3);
+            cursor = 0;
             scroll = 0;
         }
-        if (check(PrevPress) && scroll > 0) scroll--;
-        if (check(NextPress)) scroll++;
-        char ch = checkLetterShortcutPress();
         if (ch == 'l' || ch == 'L') chLocked = !chLocked;
 
         // Headless trigger: any serial line dumps the current table.

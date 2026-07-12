@@ -170,6 +170,15 @@ std::vector<ApRec> aps;
 std::vector<DeauthSrc> deauthSrcs;
 
 int scroll = 0;
+int cursor = 0;          // selected row (index into the unified display order)
+bool detailView = false; // showing the per-row detail page for `cursor`
+
+// A selectable row in the unified list: a flagged AP or a standalone deauth src.
+enum RowKind : uint8_t { ROW_AP = 0, ROW_DEAUTH = 1 };
+struct RogueRow {
+    uint8_t kind;
+    int idx; // index into aps[] (ROW_AP) or deauthSrcs[] (ROW_DEAUTH)
+};
 
 size_t chIdx = 0;
 bool chLocked = false;
@@ -362,7 +371,7 @@ void drawChrome() {
     }
 }
 void drawFooter() {
-    String hint = "^v scroll  l lock  <-exit";
+    String hint = detailView ? "<-/SEL back  ^v scroll" : "SEL details  ^v select  l lock  <-exit";
     if (footerCache == hint) return;
     footerCache = hint;
     tft.fillRect(0, tftHeight - FOOTER_H, tftWidth, FOOTER_H, TFT_BLACK);
@@ -371,48 +380,47 @@ void drawFooter() {
     tft.drawString(hint, 4, tftHeight - FOOTER_H + 1);
 }
 
-void drawBody() {
-    int rows = (tftHeight - CHROME_H - FOOTER_H) / ROW_H;
-    if (rows > MAX_ROWS) rows = MAX_ROWS;
+String fmtSpan(uint32_t ms) {
+    uint32_t s = ms / 1000;
+    if (s < 60) return String(s) + "s";
+    if (s < 3600) return String(s / 60) + "m" + String(s % 60) + "s";
+    return String(s / 3600) + "h" + String((s % 3600) / 60) + "m";
+}
 
-    // Suspicious APs (reason != 0), sorted by RSSI, then heavy deauth sources
-    // that aren't in the AP list.
+// Build the unified selectable list: flagged APs (reason != 0) sorted by signal,
+// then heavy deauth sources not already covered by a flagged AP. Shared by the
+// table and the detail page so `cursor` maps to the same record in both.
+void buildRogueList(std::vector<RogueRow> &out) {
+    out.clear();
     std::vector<int> idx;
     for (size_t i = 0; i < aps.size(); i++)
         if (aps[i].reason) idx.push_back((int)i);
     std::sort(idx.begin(), idx.end(), [&](int a, int b) { return aps[a].bestRssi > aps[b].bestRssi; });
-
-    std::vector<String> lines;
-    std::vector<uint16_t> fgs;
-    for (int i : idx) {
-        const ApRec &ap = aps[i];
-        String ssid = ap.ssids[0][0] ? String(ap.ssids[0]) : String("<?>");
-        if (ssid.length() > 12) ssid = ssid.substring(0, 12);
-        String rc;
-        if (ap.reason & R_KARMA) rc += "K";
-        if (ap.reason & R_EVILTWIN) rc += "E";
-        if (ap.reason & R_DEAUTH) rc += "D";
-        String extra = (ap.reason & R_KARMA) ? (" #" + String(ap.distinctSsids)) : "";
-        lines.push_back(
-            rc + " " + ssid + extra + " c" + String(ap.ch) + " " + String(ap.rssi) + " " +
-            macStr(ap.bssid).substring(9)
-        );
-        fgs.push_back(TFT_RED);
-    }
-    for (auto &s : deauthSrcs) {
-        if (s.count < DEAUTH_SRC_THRESH) continue;
+    for (int i : idx) out.push_back({ROW_AP, i});
+    for (size_t si = 0; si < deauthSrcs.size(); si++) {
+        if (deauthSrcs[si].count < DEAUTH_SRC_THRESH) continue;
         bool isAp = false;
         for (auto &ap : aps)
-            if (sameMac(ap.bssid, s.mac) && ap.reason) {
+            if (sameMac(ap.bssid, deauthSrcs[si].mac) && ap.reason) {
                 isAp = true;
                 break;
             }
         if (isAp) continue;
-        lines.push_back("D deauth " + macStr(s.mac).substring(9) + " x" + String(s.count));
-        fgs.push_back(TFT_YELLOW);
+        out.push_back({ROW_DEAUTH, (int)si});
     }
+}
 
-    int total = (int)lines.size();
+void drawBody() {
+    int rows = (tftHeight - CHROME_H - FOOTER_H) / ROW_H;
+    if (rows > MAX_ROWS) rows = MAX_ROWS;
+
+    std::vector<RogueRow> list;
+    buildRogueList(list);
+    int total = (int)list.size();
+    if (cursor >= total) cursor = total ? total - 1 : 0;
+    if (cursor < 0) cursor = 0;
+    if (cursor < scroll) scroll = cursor;
+    if (cursor >= scroll + rows) scroll = cursor - rows + 1;
     int maxScroll = total - rows;
     if (maxScroll < 0) maxScroll = 0;
     if (scroll > maxScroll) scroll = maxScroll;
@@ -427,8 +435,95 @@ void drawBody() {
             else drawRow(slot, y, "", TFT_WHITE);
             continue;
         }
-        drawRow(slot, y, lines[li], fgs[li]);
+        char sel = (li == cursor) ? '>' : ' ';
+        if (list[li].kind == ROW_AP) {
+            const ApRec &ap = aps[list[li].idx];
+            String ssid = ap.ssids[0][0] ? String(ap.ssids[0]) : String("<?>");
+            if (ssid.length() > 11) ssid = ssid.substring(0, 11);
+            String rc;
+            if (ap.reason & R_KARMA) rc += "K";
+            if (ap.reason & R_EVILTWIN) rc += "E";
+            if (ap.reason & R_DEAUTH) rc += "D";
+            String extra = (ap.reason & R_KARMA) ? (" #" + String(ap.distinctSsids)) : "";
+            String line = String(sel) + rc + " " + ssid + extra + " c" + String(ap.ch) + " " +
+                          String(ap.rssi) + " " + macStr(ap.bssid).substring(9);
+            drawRow(slot, y, line, li == cursor ? TFT_CYAN : TFT_RED);
+        } else {
+            const DeauthSrc &s = deauthSrcs[list[li].idx];
+            String line = String(sel) + "D deauth " + macStr(s.mac).substring(9) + " x" + String(s.count);
+            drawRow(slot, y, line, li == cursor ? TFT_CYAN : TFT_YELLOW);
+        }
     }
+}
+
+// Per-row detail page: full MAC/BSSID and a plain-language breakdown of *why*
+// the row was flagged (which heuristic(s) fired and the evidence behind each).
+void drawDetail() {
+    std::vector<RogueRow> list;
+    buildRogueList(list);
+    if (list.empty()) {
+        drawRow(0, CHROME_H, "  (nothing selected)", TFT_DARKGREY);
+        for (int s = 1; s < MAX_ROWS; s++) drawRow(s, CHROME_H + s * ROW_H, "", TFT_WHITE);
+        return;
+    }
+    if (cursor >= (int)list.size()) cursor = list.size() - 1;
+    if (cursor < 0) cursor = 0;
+
+    String lines[MAX_ROWS];
+    uint16_t fgs[MAX_ROWS];
+    for (int i = 0; i < MAX_ROWS; i++) { lines[i] = ""; fgs[i] = TFT_WHITE; }
+    int n = 0;
+    uint32_t now = millis();
+
+    if (list[cursor].kind == ROW_AP) {
+        const ApRec &ap = aps[list[cursor].idx];
+        lines[n] = String("BSSID: ") + macStr(ap.bssid); fgs[n++] = TFT_WHITE;
+        lines[n] = String("SSID: ") + (ap.ssids[0][0] ? String(ap.ssids[0]) : String("<hidden>"));
+        fgs[n++] = TFT_CYAN;
+        lines[n] = String("Ch ") + ap.ch + "  enc " + encName(ap.enc) + "  x" + String(ap.count);
+        fgs[n++] = TFT_WHITE;
+        lines[n] = String("RSSI ") + ap.rssi + " (best " + ap.bestRssi + ")  " + fmtSpan(now - ap.lastMs) + " ago";
+        fgs[n++] = TFT_WHITE;
+        lines[n] = String("Distinct SSIDs: ") + ap.distinctSsids; fgs[n++] = TFT_WHITE;
+        lines[n] = String("Reason: ") + reasonStr(ap.reason); fgs[n++] = TFT_RED;
+        lines[n] = ""; fgs[n++] = TFT_WHITE;
+        lines[n] = "Why flagged:"; fgs[n++] = bruceConfig.priColor;
+        if (ap.reason & R_KARMA) {
+            lines[n] = String("- KARMA: answers ") + ap.distinctSsids + " SSIDs"; fgs[n++] = TFT_WHITE;
+            lines[n] = String("  (>= ") + KARMA_THRESH + " from one BSSID)"; fgs[n++] = TFT_WHITE;
+        }
+        if (ap.reason & R_EVILTWIN) {
+            lines[n] = "- EVIL TWIN: same SSID also on"; fgs[n++] = TFT_WHITE;
+            lines[n] = "  a different BSSID"; fgs[n++] = TFT_WHITE;
+        }
+        if (ap.reason & R_DEAUTH) {
+            lines[n] = "- DEAUTH: this BSSID floods"; fgs[n++] = TFT_WHITE;
+            lines[n] = "  deauth/disassoc frames"; fgs[n++] = TFT_WHITE;
+        }
+        // Show the sampled SSIDs behind a Karma flag (the evidence).
+        if ((ap.reason & R_KARMA) && ap.nSamples > 0 && n < MAX_ROWS - 1) {
+            String s = "SSIDs: ";
+            for (uint8_t i = 0; i < ap.nSamples && s.length() < 34; i++) {
+                if (i) s += ",";
+                s += ap.ssids[i];
+            }
+            lines[n] = s; fgs[n++] = TFT_DARKGREY;
+        }
+    } else {
+        const DeauthSrc &s = deauthSrcs[list[cursor].idx];
+        lines[n] = String("Deauth source"); fgs[n++] = TFT_YELLOW;
+        lines[n] = String("MAC: ") + macStr(s.mac); fgs[n++] = TFT_WHITE;
+        lines[n] = String("Ch ") + s.ch + "  RSSI " + s.rssi; fgs[n++] = TFT_WHITE;
+        lines[n] = String("Deauth frames: ") + s.count; fgs[n++] = TFT_WHITE;
+        lines[n] = ""; fgs[n++] = TFT_WHITE;
+        lines[n] = "Why flagged:"; fgs[n++] = bruceConfig.priColor;
+        lines[n] = String("- >= ") + DEAUTH_SRC_THRESH + " deauth frames from"; fgs[n++] = TFT_WHITE;
+        lines[n] = "  one source (jammer / MITM"; fgs[n++] = TFT_WHITE;
+        lines[n] = "  kick to force reconnect)"; fgs[n++] = TFT_WHITE;
+    }
+
+    for (int slot = 0; slot < MAX_ROWS; slot++)
+        drawRow(slot, CHROME_H + slot * ROW_H, lines[slot], fgs[slot]);
 }
 
 void rogueDraw() {
@@ -438,7 +533,8 @@ void rogueDraw() {
         fullClear = false;
     }
     drawChrome();
-    drawBody();
+    if (detailView) drawDetail();
+    else drawBody();
     drawFooter();
 }
 
@@ -471,6 +567,8 @@ void rogue_ap() {
     cbDeauth = 0;
     lastDeauthCount = deauthRate = 0;
     scroll = 0;
+    cursor = 0;
+    detailView = false;
     chIdx = 0;
     chLocked = false;
     fullClear = true;
@@ -505,7 +603,7 @@ void rogue_ap() {
     lastHopMs = lastRateMs = millis();
     uint8_t prevFlagged = 0;
 
-    while (!check(EscPress)) {
+    while (true) {
         RogueEvent e;
         int drained = 0;
         while (drained++ < 64 && ringPop(e)) {
@@ -534,8 +632,26 @@ void rogue_ap() {
             lastRateMs = now;
         }
 
-        if (check(PrevPress) && scroll > 0) scroll--;
-        if (check(NextPress)) scroll++;
+        // ESC: in the detail page, go back to the list; in the list, exit.
+        if (check(EscPress)) {
+            if (detailView) {
+                detailView = false;
+                fullClear = true;
+            } else break;
+        }
+        if (check(SelPress)) {
+            std::vector<RogueRow> list;
+            buildRogueList(list);
+            if (detailView) detailView = false;
+            else if (!list.empty()) detailView = true;
+            fullClear = true;
+        }
+        if (check(PrevPress)) {
+            if (!detailView && cursor > 0) cursor--;
+        }
+        if (check(NextPress)) {
+            if (!detailView) cursor++;
+        }
         char c = checkLetterShortcutPress();
         if (c == 'l' || c == 'L') chLocked = !chLocked;
         if (Serial.available()) {

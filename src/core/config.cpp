@@ -77,6 +77,9 @@ JsonDocument BruceConfig::toJson() const {
     JsonArray dm = setting["disabledMenus"].to<JsonArray>();
     for (int i = 0; i < disabledMenus.size(); i++) { dm.add(disabledMenus[i]); }
 
+    JsonArray _camSsidPatterns = setting["camSsidPatterns"].to<JsonArray>();
+    for (const auto &p : camSsidPatterns) _camSsidPatterns.add(p);
+
     JsonArray qrArray = setting["qrCodes"].to<JsonArray>();
     for (const auto &entry : qrCodes) {
         JsonObject qrEntry = qrArray.add<JsonObject>();
@@ -425,6 +428,15 @@ void BruceConfig::fromFile(bool checkFS) {
         disabledMenus.clear();
         JsonArray dm = setting["disabledMenus"].as<JsonArray>();
         for (JsonVariant e : dm) { disabledMenus.push_back(e.as<String>()); }
+    } else {
+        count++;
+        log_e("Fail");
+    }
+
+    if (!setting["camSsidPatterns"].isNull()) {
+        camSsidPatterns.clear();
+        JsonArray cp = setting["camSsidPatterns"].as<JsonArray>();
+        for (JsonVariant e : cp) { camSsidPatterns.push_back(e.as<String>()); }
     } else {
         count++;
         log_e("Fail");

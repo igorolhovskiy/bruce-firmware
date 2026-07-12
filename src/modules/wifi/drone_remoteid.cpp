@@ -411,7 +411,7 @@ void drawChrome() {
 }
 
 void drawFooter() {
-    String hint = detailView ? "<- back" : "SEL detailView  ^v sel  m mode  <-exit";
+    String hint = detailView ? "<-/SEL back" : "SEL details  ^v select  m mode  <-exit";
     if (footerCache == hint) return;
     footerCache = hint;
     tft.fillRect(0, tftHeight - FOOTER_H, tftWidth, FOOTER_H, TFT_BLACK);
@@ -614,7 +614,7 @@ void drone_remoteid() {
     startWifi();
     droneDraw();
 
-    while (!check(EscPress)) {
+    while (true) {
         OdidEvent e;
         int drained = 0;
         while (drained++ < 8 && ringPop(e)) onEvent(e);
@@ -624,7 +624,18 @@ void drone_remoteid() {
             hopChannel();
         }
 
-        if (check(SelPress)) detailView = !detailView;
+        // ESC: in the detail page, go back to the list; in the list, exit.
+        if (check(EscPress)) {
+            if (detailView) {
+                detailView = false;
+                fullClear = true;
+            } else break;
+        }
+        if (check(SelPress)) {
+            if (detailView) detailView = false;
+            else if (!drones.empty()) detailView = true;
+            fullClear = true;
+        }
         if (check(PrevPress)) {
             if (detailView) { /* single drone view */ }
             else if (cursor > 0) cursor--;

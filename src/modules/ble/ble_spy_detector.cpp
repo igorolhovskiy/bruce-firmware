@@ -27,6 +27,11 @@ namespace {
 enum Conf : uint8_t { CONF_LOW = 0, CONF_MED = 1, CONF_HIGH = 2 };
 const char *confName(uint8_t c) { return c == CONF_HIGH ? "HIGH" : c == CONF_MED ? "MED" : "LOW"; }
 
+// Which heuristic(s) flagged a sighting (shown on the detail "why" page).
+constexpr uint8_t VIA_OUI = 0x01;     // MAC OUI matched the vendor DB
+constexpr uint8_t VIA_COMPANY = 0x02; // BLE manufacturer company ID matched
+constexpr uint8_t VIA_NAME = 0x04;    // advertised name matched a gadget pattern
+
 // Small, extensible BLE manufacturer company-ID table for gadget vendors that are
 // predominantly cameras / recorders. Kept deliberately tiny to avoid flagging
 // every phone/watch; extend as needed.
@@ -85,6 +90,8 @@ struct Sighting {
     int8_t rssi;
     uint8_t klass;
     uint8_t conf;
+    uint8_t via;      // VIA_* bitmask: which heuristic(s) fired
+    uint16_t company; // BLE manufacturer company ID (0xFFFF if none)
     char vendor[20];
     char name[24];
 };
@@ -153,6 +160,7 @@ bool classify(const uint8_t *addr, uint8_t addrType, const char *name, uint16_t 
     bool hit = false;
     uint8_t conf = CONF_LOW;
     uint8_t klass = OUI_NONE;
+    uint8_t via = 0;
     const char *vendor = "?";
 
     // (1) OUI DB on the address (public/static addresses only - random addresses
@@ -161,6 +169,7 @@ bool classify(const uint8_t *addr, uint8_t addrType, const char *name, uint16_t 
         const OuiEntry *o = lookupOui(addr);
         if (o && (o->klass == OUI_CAM || o->klass == OUI_DRONE || o->klass == OUI_IOT)) {
             hit = true;
+            via |= VIA_OUI;
             klass = o->klass;
             vendor = o->vendor;
             conf = o->klass == OUI_CAM ? CONF_HIGH : CONF_MED;
@@ -171,6 +180,7 @@ bool classify(const uint8_t *addr, uint8_t addrType, const char *name, uint16_t 
         for (size_t i = 0; i < N_BLE_SIGS; i++)
             if (BLE_SIGS[i].company == company) {
                 hit = true;
+                via |= VIA_COMPANY;
                 if (klass == OUI_NONE) klass = BLE_SIGS[i].klass;
                 if (vendor[0] == '?') vendor = BLE_SIGS[i].vendor;
                 if (conf < CONF_MED) conf = CONF_MED;
@@ -180,6 +190,7 @@ bool classify(const uint8_t *addr, uint8_t addrType, const char *name, uint16_t 
     // (3) Device-name pattern.
     if (nameMatches(name)) {
         hit = true;
+        via |= VIA_NAME;
         if (klass == OUI_NONE) klass = OUI_CAM;
         if (conf < CONF_MED) conf = CONF_MED;
     }
@@ -187,6 +198,7 @@ bool classify(const uint8_t *addr, uint8_t addrType, const char *name, uint16_t 
     if (!hit) return false;
     s.klass = klass;
     s.conf = conf;
+    s.via = via;
     strlcpy(s.vendor, vendor, sizeof(s.vendor));
     return true;
 }
@@ -208,6 +220,7 @@ class SpyCallbacks : public NimBLEScanCallbacks {
         if (!classify(addrBytes, addrType, name, company, s)) return;
         strlcpy(s.addr, addrStr.c_str(), sizeof(s.addr));
         s.addrType = addrType;
+        s.company = company;
         s.rssi = dev->getRSSI();
         strlcpy(s.name, name, sizeof(s.name));
         ringPush(s);
@@ -221,6 +234,9 @@ struct SpyEnt {
     char name[24];
     uint8_t klass;
     uint8_t conf;
+    uint8_t via;      // VIA_* bitmask
+    uint8_t addrType; // 0 = public
+    uint16_t company; // BLE company ID (0xFFFF if none)
     int8_t rssi, bestRssi;
     uint16_t count;
     uint32_t firstMs, lastMs;
@@ -228,6 +244,8 @@ struct SpyEnt {
 constexpr size_t SPY_MAX = 128;
 std::vector<SpyEnt> spies;
 int scroll = 0;
+int cursor = 0;          // selected row (index into the sorted display order)
+bool detailView = false; // showing the per-gadget detail page for `cursor`
 
 // ── SD logging ───────────────────────────────────────────────────────────────
 bool spySd = false;
@@ -265,6 +283,8 @@ void onSighting(const Sighting &s) {
             e.lastMs = millis();
             if (e.count < 0xFFFF) e.count++;
             if (s.conf > e.conf) e.conf = s.conf;
+            e.via |= s.via;
+            if (s.company != 0xFFFF) e.company = s.company;
             if (e.name[0] == 0 && s.name[0]) strlcpy(e.name, s.name, sizeof(e.name));
             if (s.klass != OUI_NONE) e.klass = s.klass;
             logSighting(s);
@@ -283,6 +303,9 @@ void onSighting(const Sighting &s) {
     strlcpy(e.name, s.name, sizeof(e.name));
     e.klass = s.klass;
     e.conf = s.conf;
+    e.via = s.via;
+    e.addrType = s.addrType;
+    e.company = s.company;
     e.rssi = e.bestRssi = s.rssi;
     e.count = 1;
     e.firstMs = e.lastMs = millis();
@@ -351,7 +374,7 @@ void drawChrome() {
     }
 }
 void drawFooter() {
-    String hint = "^v scroll  <-exit";
+    String hint = detailView ? "<-/SEL back  ^v scroll" : "SEL details  ^v select  <-exit";
     if (footerCache == hint) return;
     footerCache = hint;
     tft.fillRect(0, tftHeight - FOOTER_H, tftWidth, FOOTER_H, TFT_BLACK);
@@ -359,15 +382,34 @@ void drawFooter() {
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
     tft.drawString(hint, 4, tftHeight - FOOTER_H + 1);
 }
+
+String fmtSpan(uint32_t ms) {
+    uint32_t s = ms / 1000;
+    if (s < 60) return String(s) + "s";
+    if (s < 3600) return String(s / 60) + "m" + String(s % 60) + "s";
+    return String(s / 3600) + "h" + String((s % 3600) / 60) + "m";
+}
+
+// Build the sorted display order (shared by table + detail so `cursor` maps to
+// the same gadget in both).
+void buildSpyOrder(std::vector<int> &idx) {
+    idx.resize(spies.size());
+    for (size_t i = 0; i < spies.size(); i++) idx[i] = (int)i;
+    std::sort(idx.begin(), idx.end(), [&](int a, int b) { return spies[a].bestRssi > spies[b].bestRssi; });
+}
+
 void drawBody() {
     int rows = (tftHeight - CHROME_H - FOOTER_H) / ROW_H;
     if (rows > MAX_ROWS) rows = MAX_ROWS;
 
-    std::vector<int> idx(spies.size());
-    for (size_t i = 0; i < spies.size(); i++) idx[i] = (int)i;
-    std::sort(idx.begin(), idx.end(), [&](int a, int b) { return spies[a].bestRssi > spies[b].bestRssi; });
+    std::vector<int> idx;
+    buildSpyOrder(idx);
 
     int total = (int)idx.size();
+    if (cursor >= total) cursor = total ? total - 1 : 0;
+    if (cursor < 0) cursor = 0;
+    if (cursor < scroll) scroll = cursor;
+    if (cursor >= scroll + rows) scroll = cursor - rows + 1;
     int maxScroll = total - rows;
     if (maxScroll < 0) maxScroll = 0;
     if (scroll > maxScroll) scroll = maxScroll;
@@ -384,13 +426,63 @@ void drawBody() {
         const SpyEnt &e = spies[idx[li]];
         char cflag = e.conf == CONF_HIGH ? 'H' : e.conf == CONF_MED ? 'M' : 'L';
         String label = e.name[0] ? String(e.name) : String(e.vendor);
-        if (label.length() > 14) label = label.substring(0, 14);
-        String line = String(cflag) + " " + String(ouiClassName(e.klass)) + " " + label + " " +
-                      String(e.rssi) + " x" + String(e.count) + " " + String(e.addr).substring(9);
-        uint16_t fg = e.conf == CONF_HIGH ? TFT_RED : e.conf == CONF_MED ? TFT_YELLOW : TFT_DARKGREY;
+        if (label.length() > 13) label = label.substring(0, 13);
+        String line = String(li == cursor ? '>' : ' ') + String(cflag) + " " +
+                      String(ouiClassName(e.klass)) + " " + label + " " + String(e.rssi) + " x" +
+                      String(e.count) + " " + String(e.addr).substring(9);
+        uint16_t fg = li == cursor            ? TFT_CYAN
+                      : e.conf == CONF_HIGH   ? TFT_RED
+                      : e.conf == CONF_MED    ? TFT_YELLOW
+                                              : TFT_DARKGREY;
         drawRow(slot, y, line, fg);
     }
 }
+
+// Per-gadget detail page: full BLE address, vendor guess, and which of the three
+// heuristics fired (OUI / company-ID / name pattern) with the confidence reason.
+void drawDetail() {
+    std::vector<int> idx;
+    buildSpyOrder(idx);
+    if (idx.empty()) {
+        drawRow(0, CHROME_H, "  (no gadget selected)", TFT_DARKGREY);
+        for (int s = 1; s < MAX_ROWS; s++) drawRow(s, CHROME_H + s * ROW_H, "", TFT_WHITE);
+        return;
+    }
+    if (cursor >= (int)idx.size()) cursor = idx.size() - 1;
+    if (cursor < 0) cursor = 0;
+    const SpyEnt &e = spies[idx[cursor]];
+    uint32_t now = millis();
+
+    String lines[MAX_ROWS];
+    uint16_t fgs[MAX_ROWS];
+    for (int i = 0; i < MAX_ROWS; i++) { lines[i] = ""; fgs[i] = TFT_WHITE; }
+    int n = 0;
+    uint16_t confFg = e.conf == CONF_HIGH ? TFT_RED : e.conf == CONF_MED ? TFT_YELLOW : TFT_DARKGREY;
+
+    lines[n] = String("Addr: ") + e.addr; fgs[n++] = TFT_WHITE;
+    lines[n] = String("(") + (e.addrType == 0 ? "public" : "random") + " address)"; fgs[n++] = TFT_DARKGREY;
+    lines[n] = String("Vendor: ") + e.vendor; fgs[n++] = TFT_CYAN;
+    lines[n] = String("Class: ") + ouiClassName(e.klass); fgs[n++] = TFT_WHITE;
+    lines[n] = String("Name: ") + (e.name[0] ? String(e.name) : String("<none>")); fgs[n++] = TFT_WHITE;
+    if (e.company != 0xFFFF) {
+        char cid[24];
+        snprintf(cid, sizeof(cid), "Company ID: 0x%04X", e.company);
+        lines[n] = cid; fgs[n++] = TFT_WHITE;
+    }
+    lines[n] = String("RSSI: ") + e.rssi + " (best " + e.bestRssi + ")"; fgs[n++] = TFT_WHITE;
+    lines[n] = String("Seen x") + e.count + "  last " + fmtSpan(now - e.lastMs) + " ago"; fgs[n++] = TFT_WHITE;
+    lines[n] = String("Confidence: ") + confName(e.conf); fgs[n++] = confFg;
+    lines[n] = ""; fgs[n++] = TFT_WHITE;
+    lines[n] = "Why flagged:"; fgs[n++] = bruceConfig.priColor;
+    if (e.via & VIA_OUI) { lines[n] = "- MAC OUI matches vendor DB"; fgs[n++] = TFT_WHITE; }
+    if (e.via & VIA_COMPANY) { lines[n] = "- BLE company ID matches"; fgs[n++] = TFT_WHITE; }
+    if (e.via & VIA_NAME) { lines[n] = "- name matches gadget pattern"; fgs[n++] = TFT_WHITE; }
+    lines[n] = "Heuristic - not proof."; fgs[n++] = TFT_DARKGREY;
+
+    for (int slot = 0; slot < MAX_ROWS; slot++)
+        drawRow(slot, CHROME_H + slot * ROW_H, lines[slot], fgs[slot]);
+}
+
 void spyDraw() {
     if (fullClear) {
         tft.fillScreen(TFT_BLACK);
@@ -398,7 +490,8 @@ void spyDraw() {
         fullClear = false;
     }
     drawChrome();
-    drawBody();
+    if (detailView) drawDetail();
+    else drawBody();
     drawFooter();
 }
 
@@ -409,6 +502,8 @@ void ble_spy_detector() {
     spies.clear();
     ringHead = ringTail = ringDropped = 0;
     scroll = 0;
+    cursor = 0;
+    detailView = false;
     fullClear = true;
 
     spySd = false;
@@ -435,13 +530,29 @@ void ble_spy_detector() {
 
     spyDraw();
 
-    while (!check(EscPress)) {
+    while (true) {
         Sighting s;
         int drained = 0;
         while (drained++ < 32 && ringPop(s)) onSighting(s);
 
-        if (check(PrevPress) && scroll > 0) scroll--;
-        if (check(NextPress)) scroll++;
+        // ESC: in the detail page, go back to the list; in the list, exit.
+        if (check(EscPress)) {
+            if (detailView) {
+                detailView = false;
+                fullClear = true;
+            } else break;
+        }
+        if (check(SelPress)) {
+            if (detailView) detailView = false;
+            else if (!spies.empty()) detailView = true;
+            fullClear = true;
+        }
+        if (check(PrevPress)) {
+            if (!detailView && cursor > 0) cursor--;
+        }
+        if (check(NextPress)) {
+            if (!detailView) cursor++;
+        }
 
         spyDraw();
         delay(20);
