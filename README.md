@@ -38,6 +38,14 @@ Features developed in this fork, on top of stock Bruce. Each is T-Deck Plus only
   hop to a bogus channel and drop off. Destination channel is adjustable live with the trackball.
   Because CSA rides in unprotected beacons, it works where deauth is blocked by PMF. Authorized
   testing only.
+- **WiFi Block-Ack (BAR) DoS** — Block Ack Request denial-of-service (Wifi Atks → Block-Ack DoS),
+  based on the "Bl0ck" technique (arXiv:2302.05899). Select a target AP, harvest its associated STA
+  MACs, then flood forged compressed BlockAckReq control frames (spoofed AP as transmitter) with the
+  Starting Sequence Number swept forward, so the victim's reorder window jumps and legit frames are
+  dropped. BAR is a *control* frame, so — like CSA and unlike deauth/disassoc — it is **not** covered
+  by 802.11w/PMF and keeps working against PMF-enforcing WPA3 networks. Restores WiFi mode on exit.
+  Authorized testing only. Its passive counterpart is the **Block-Ack Flood** detector under
+  Counter-Surveil (below).
 - **[LoRa Recon](./docs/lora-recon-README.md)** — passive, receive-only LoRa/LoRaWAN
   reconnaissance (EU868): channel/SF sweep, human-readable frame decode, replay/FCnt anomaly hints.
 - **[Meshtastic LF](./docs/meshtastic-README.md)** — two-way Meshtastic text client on the default
@@ -45,7 +53,10 @@ Features developed in this fork, on top of stock Bruce. Each is T-Deck Plus only
   list, duty-cycle limited. Interoperates with stock Meshtastic (default key). Broadcasts a
   self-NodeInfo so peers list this device by name rather than a bare `!id`, stamps each conversation
   line with a wall-clock (or uptime-relative) time, transliterates Latin-1 accents to ASCII so EU
-  mesh text is readable, and can dump a raw RX diagnostic log to SD (`/meshtastic_raw.log`).
+  mesh text is readable, and can dump a raw RX diagnostic log to SD (`/meshtastic_raw.log`). Sent
+  messages carry a **WhatsApp-style delivery tick** — an accent single mark while awaiting
+  confirmation, turning to a **green double tick** once another node rebroadcasts the packet
+  (Meshtastic's implicit broadcast ACK; `want_ack` is set on outgoing text).
 - **IR via M5Stack Unit IR** — full Bruce IR (TV-B-Gone, receiver, custom IR) over the T-Deck Plus
   Grove port (GPIO43/44) using an external M5Stack Unit IR.
 - **RFID2 extensions** — for the M5Stack RFID2 (PN532) on the Grove port: load a MIFARE key
@@ -61,8 +72,10 @@ Features developed in this fork, on top of stock Bruce. Each is T-Deck Plus only
   **Rogue AP / Karma** (many-SSIDs-per-BSSID Karma, evil-twin, deauth-flood); **BLE Spy Tags** (hidden
   BLE cameras/doorbells/recorders via the shared vendor DB, device-name patterns, and company-ID);
   **Follower Scan** (dwell-time model over WiFi-probe + BLE addresses; mark "I moved" to surface an
-  address that follows you); and the relocated Tracker Detector below. An **About / Limits** entry
-  states the hardware non-goals on-device.
+  address that follows you); **Block-Ack Flood** (passive counterpart to the BAR DoS above — captures
+  802.11 BlockAckReq control frames, tracks per-transmitter BAR rate / broadcast-RA use / sequence-number
+  jumps, and flags a flood at ≥12 BAR/s); and the relocated Tracker Detector below. An **About / Limits**
+  entry states the hardware non-goals on-device.
 - **[Tracker Detector](./docs/ble-tracker-detector-README.md)** — passive, receive-only scan
   (**now under Detector → Tracker Detector**, moved out of the BLE menu) that classifies
   advertisements as Apple Find My/AirTag, Tile, or Samsung SmartTag; builds a live per-device table
@@ -131,8 +144,8 @@ These are inherited from upstream Bruce and available on the T-Deck Plus. See th
     - [x] [Optional] DoScreen a very long name and face
     - [x] [Optional] Flood uniq peer identifiers
 
-> This fork adds **WiFi Analyzer**, **WiFi Passive Recon**, and a **CSA Attack** (under Target Atks) —
-> see "What this fork adds" above.
+> This fork adds **WiFi Analyzer**, **WiFi Passive Recon**, a **CSA Attack** (under Target Atks), and a
+> **Block-Ack (BAR) DoS** (under Wifi Atks) — see "What this fork adds" above.
 </details>
 
 <details>
