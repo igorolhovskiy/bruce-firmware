@@ -91,7 +91,9 @@ struct ConvMsg {
     float rssi;
     float snr;
     uint32_t atMs;
-    String clk; // "HH:MM:SS" wall-clock at arrival, or "+HH:MM:SS" uptime if clock unset
+    String clk;         // "HH:MM:SS" wall-clock at arrival, or "+HH:MM:SS" uptime if clock unset
+    uint32_t id = 0;    // our on-air packet id (mine only) - correlates the delivery ACK
+    bool confirmed = false; // mine: a neighbour rebroadcast our packet (implicit ACK)
 };
 std::vector<ConvMsg> convo; // oldest at front, newest at back
 constexpr size_t MAX_CONVO = 60;
@@ -216,7 +218,7 @@ void setNodeName(uint32_t id, const String &name) {
         }
 }
 
-void addConvMsg(uint32_t from, bool mine, const String &text, float rssi, float snr) {
+void addConvMsg(uint32_t from, bool mine, const String &text, float rssi, float snr, uint32_t id = 0) {
     ConvMsg m;
     m.from = from;
     m.mine = mine;
@@ -225,9 +227,24 @@ void addConvMsg(uint32_t from, bool mine, const String &text, float rssi, float 
     m.snr = snr;
     m.atMs = millis();
     m.clk = nowClock();
+    m.id = id;
     convo.push_back(m);
     if (convo.size() > MAX_CONVO) convo.erase(convo.begin());
     if (convScroll != 0) convScroll++; // keep the same messages in view when not pinned to bottom
+}
+
+// Mark our newest still-unconfirmed sent message with this packet id as delivered.
+// Called when we hear our own packet back (a neighbour rebroadcast it) - the
+// implicit ACK Meshtastic uses for broadcasts. Returns true if a message flipped.
+bool confirmSentMsg(uint32_t id) {
+    if (id == 0) return false;
+    for (auto it = convo.rbegin(); it != convo.rend(); ++it) {
+        if (it->mine && it->id == id && !it->confirmed) {
+            it->confirmed = true;
+            return true;
+        }
+    }
+    return false;
 }
 
 void IRAM_ATTR onMeshPacket() {
@@ -346,6 +363,17 @@ void decodeMeshFrame(const uint8_t *buf, size_t len, float rssi, float snr) {
         hdr.hopStart(), hdr.next_hop, hdr.relay_node
     );
 
+    // Our own packet heard back = a neighbour rebroadcast it: the implicit delivery
+    // ACK Meshtastic uses for broadcasts. Confirm the pending message (turns its
+    // tick green) and never surface our own traffic as an incoming message.
+    if (hdr.from == ourNodeId) {
+        bool acked = confirmSentMsg(hdr.id);
+        Serial.printf("[Meshtastic]   heard our own packet id=0x%08x back%s\n", (unsigned)hdr.id,
+                      acked ? " -> delivery confirmed" : "");
+        if (acked && view == View::Conversation) needsRedraw = true;
+        return;
+    }
+
     if (hdr.channel != meshtastic::LONGFAST_CHANNEL_HASH) {
         Serial.printf(
             "[Meshtastic]   channel 0x%02x != LongFast 0x%02x - not our channel, skipped\n", hdr.channel,
@@ -448,7 +476,7 @@ uint32_t deriveNodeId() {
 // transmit; false if empty, encode-failed, blocked, or radio error. Runs only from
 // the main loop (user action or the periodic announce) — never from the RX ISR.
 bool txMeshData(uint32_t portnum, const uint8_t *payload, size_t payloadLen, bool reportBlock,
-                const char *label) {
+                const char *label, bool wantAck = false, uint32_t *outId = nullptr) {
     if (!meshRadio) return false;
 
     uint8_t data[meshtastic::MAX_PLAINTEXT];
@@ -460,6 +488,7 @@ bool txMeshData(uint32_t portnum, const uint8_t *payload, size_t payloadLen, boo
 
     uint32_t id = esp_random();
     if (id == 0) id = 1; // id 0 is reserved / a poor nonce input
+    if (outId) *outId = id;
 
     uint8_t nonce[16];
     meshtastic::initNonce(ourNodeId, id, nonce);
@@ -470,7 +499,7 @@ bool txMeshData(uint32_t portnum, const uint8_t *payload, size_t payloadLen, boo
     h.to = meshtastic::BROADCAST_ADDR;
     h.from = ourNodeId;
     h.id = id;
-    h.flags = meshtastic::PacketHeader::makeFlags(3, false, 3); // hop_limit=3, hop_start=3
+    h.flags = meshtastic::PacketHeader::makeFlags(3, wantAck, 3); // hop_limit=3, hop_start=3
     h.channel = meshtastic::LONGFAST_CHANNEL_HASH;
     meshtastic::packHeader(h, frame);
     memcpy(frame + meshtastic::HEADER_LEN, data, dataLen);
@@ -522,11 +551,13 @@ bool txMeshData(uint32_t portnum, const uint8_t *payload, size_t payloadLen, boo
 // on explicit user action (compose/send or a serial trigger), never in a loop.
 bool sendMeshText(const String &text) {
     if (text.length() == 0) return false;
+    uint32_t sentId = 0;
     if (!txMeshData(meshtastic::TEXT_MESSAGE_APP, (const uint8_t *)text.c_str(), text.length(), true,
-                    "text"))
+                    "text", /*wantAck=*/true, &sentId))
         return false;
-    // Show our own sent line in the conversation view and log it.
-    addConvMsg(ourNodeId, true, text, 0, 0);
+    // Show our own sent line in the conversation view and log it. `sentId` lets a
+    // later rebroadcast of this packet flip the message to "delivered" (green tick).
+    addConvMsg(ourNodeId, true, text, 0, 0, sentId);
     needsRedraw = true;
     logMeshMsg("tx", ourNodeId, "", 0, 0, text);
     Serial.printf("[Meshtastic]   sent text: \"%s\"\n", text.c_str());
@@ -699,7 +730,11 @@ void drawConversation() {
         if (i < end && i < total) {
             const ConvMsg &m = convo[i];
             if (m.mine) {
-                drawBodyRow(slot, y, m.clk + " >> " + shortText(m.text, 38), bruceConfig.priColor, TFT_BLACK);
+                // Delivery ticks (WhatsApp-style): ">"  = sent, awaiting confirm (accent
+                // colour); ">>" = delivered, a neighbour rebroadcast our packet (green).
+                String prefix = m.confirmed ? " >> " : " >  ";
+                uint16_t col = m.confirmed ? TFT_GREEN : bruceConfig.priColor;
+                drawBodyRow(slot, y, m.clk + prefix + shortText(m.text, 38), col, TFT_BLACK);
             } else {
                 String who = nodeName(m.from);
                 if (who.length()) snprintf(meta, sizeof(meta), "%s: ", who.c_str());
