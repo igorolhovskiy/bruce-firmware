@@ -21,6 +21,10 @@ enum OuiClass : uint8_t {
     OUI_DRONE,   // known drone / UAV maker
     OUI_IOT,     // general IoT vendor often used in surveillance gadgets
     OUI_GENERIC, // generic Wi-Fi module vendor (ESP/Realtek) -> low confidence
+    OUI_ALPR,    // automated licence-plate reader (Motorola/Vigilant, Genetec)
+    OUI_FLOCK,   // Flock Safety fixed surveillance camera (verified MA-L only)
+    OUI_RING,    // Ring / Amazon doorbell-camera MA-L block
+    OUI_HACKER,  // pentest hardware (Flipper etc.) - used by the pentest detector
 };
 
 struct OuiEntry {

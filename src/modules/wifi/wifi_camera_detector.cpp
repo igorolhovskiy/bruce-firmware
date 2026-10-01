@@ -64,7 +64,11 @@ bool classifyCam(
     uint8_t &via
 ) {
     const OuiEntry *o = lookupOui(mac);
-    bool ouiCam = o && o->klass == OUI_CAM;
+    // CAM plus the fixed-surveillance classes (ALPR / Flock / Ring) are all
+    // treated as high-confidence vendor hits; the vendor string carries the
+    // specific category (e.g. "ALPR-Mtrla", "Flock", "Ring").
+    bool ouiCam = o && (o->klass == OUI_CAM || o->klass == OUI_ALPR ||
+                        o->klass == OUI_FLOCK || o->klass == OUI_RING);
     bool ouiGen = o && o->klass == OUI_GENERIC;
     bool ouiIot = o && o->klass == OUI_IOT;
     bool ssidHit = ssidMatchesCamera(ssid);

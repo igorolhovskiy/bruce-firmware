@@ -44,6 +44,13 @@ const BleSig BLE_SIGS[] = {
     {0x0171, "Amazon/Ring", OUI_CAM},
     {0x0157, "Huami", OUI_IOT},
     {0x05A7, "Sonos", OUI_IOT},
+    // Camera glasses (BLE SIG company IDs). MED confidence: Meta reuses these
+    // IDs across non-camera products (Quest), so a hit means a Meta radio
+    // nearby, not necessarily a lens. Source: SquachWatch-CYD signatures.cpp.
+    {0x01AB, "Meta", OUI_CAM},        // Meta Platforms
+    {0x058E, "Meta-Tech", OUI_CAM},   // Meta Platforms Technologies
+    {0x0D53, "RayBanMeta", OUI_CAM},  // Luxottica (Ray-Ban Meta glasses)
+    {0x03C2, "Snap", OUI_CAM},        // Snap Spectacles
 };
 constexpr size_t N_BLE_SIGS = sizeof(BLE_SIGS) / sizeof(BLE_SIGS[0]);
 
@@ -51,6 +58,7 @@ constexpr size_t N_BLE_SIGS = sizeof(BLE_SIGS) / sizeof(BLE_SIGS[0]);
 const char *NAME_PATTERNS[] = {
     "cam",  "ipc",  "reolink", "wyze",   "tapo",  "ezviz", "doorbell",
     "spy",  "hidden", "dvr",   "record", "audio", "bug",   "gimbal",
+    "ray-ban", "spectacles",
 };
 constexpr size_t N_NAME_PATTERNS = sizeof(NAME_PATTERNS) / sizeof(NAME_PATTERNS[0]);
 

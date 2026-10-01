@@ -4,6 +4,7 @@
 #include "core/mykeyboard.h"
 #include "core/utils.h"
 #include "modules/ble/ble_spy_detector.h"
+#include "modules/ble/pentest_detector.h"
 #include "modules/ble/tracker_detector.h"
 #include "modules/wifi/blockack_detector.h"
 #include "modules/wifi/drone_remoteid.h"
@@ -56,6 +57,7 @@ void CounterSurveilMenu::optionsMenu() {
     options.push_back({"Drone Remote ID", drone_remoteid});
     options.push_back({"Rogue AP / Karma", rogue_ap});
     options.push_back({"BLE Spy Tags", ble_spy_detector});
+    options.push_back({"Pentest Gear", pentest_detector});
     options.push_back({"Follower Scan", follower_scan});
     options.push_back({"Block-Ack DoS", blockack_detector});
     options.push_back({"About / Limits", counterSurveilAbout});

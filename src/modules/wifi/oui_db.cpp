@@ -31,6 +31,58 @@ static const OuiEntry OUI_TABLE[] = {
     {{0xD0, 0x3F, 0x27}, "Wyze", OUI_CAM},
     // Reolink / Baichuan
     {{0xEC, 0x71, 0xDB}, "Reolink", OUI_CAM},
+    // Consumer camera / doorbell vendors (IEEE MA-L, cross-checked per vendor).
+    // Source: skizzophrenic/SquachWatch-CYD signatures.cpp (GPL-3.0; OUI values
+    // are factual IEEE registry data). AGPL/GPL-3.0 compatible via §13.
+    {{0x34, 0xD2, 0x70}, "Amazon", OUI_CAM},
+    {{0xF0, 0x27, 0x2D}, "Amazon", OUI_CAM},
+    {{0xBC, 0xDD, 0xC2}, "Arlo", OUI_CAM},
+    {{0x4C, 0x69, 0x05}, "Blink", OUI_CAM},
+    {{0xA4, 0xC1, 0x38}, "Tuya", OUI_CAM},
+    // Commercial / institutional surveillance camera vendors
+    {{0xE0, 0xA7, 0x00}, "Verkada", OUI_CAM},
+    {{0x70, 0x1A, 0xD5}, "Avigilon", OUI_CAM},
+    {{0x00, 0x40, 0x8C}, "Axis", OUI_CAM},
+    {{0xB8, 0xA4, 0x4F}, "Axis", OUI_CAM},
+
+    // ── ALPR (automated licence-plate readers) ──────────────────────────────
+    // Motorola Solutions (absorbed Vigilant) + Genetec AutoVu. IEEE MA-L.
+    {{0x00, 0x04, 0x7D}, "ALPR-Mtrla", OUI_ALPR},
+    {{0x00, 0x18, 0x85}, "ALPR-Mtrla", OUI_ALPR},
+    {{0x00, 0x1F, 0x92}, "ALPR-Mtrla", OUI_ALPR},
+    {{0x4C, 0xCC, 0x34}, "ALPR-Mtrla", OUI_ALPR},
+    {{0xB8, 0xE2, 0x8C}, "ALPR-Mtrla", OUI_ALPR},
+    {{0x00, 0xBF, 0x15}, "ALPR-Gentec", OUI_ALPR},
+    {{0x0C, 0xBF, 0x15}, "ALPR-Gentec", OUI_ALPR},
+
+    // ── Flock Safety (fixed ALPR cameras) ───────────────────────────────────
+    // Only Flock's verified own MA-L block is seeded here. Flock also reuses
+    // generic Espressif/Liteon/SiLabs module OUIs (already low-confidence
+    // GENERIC below, or deliberately omitted) - matching those as FLOCK would
+    // flag every ESP32. Name/SSID/BLE-UUID Flock hits are handled elsewhere.
+    {{0xB4, 0x1E, 0x52}, "Flock", OUI_FLOCK},
+
+    // ── Ring / Amazon doorbell cameras (Ring LLC MA-L block) ────────────────
+    {{0xFC, 0x65, 0xDE}, "Ring", OUI_RING},
+    {{0x68, 0x37, 0xE9}, "Ring", OUI_RING},
+    {{0xAC, 0x9F, 0xC3}, "Ring", OUI_RING},
+    {{0x18, 0x7F, 0x88}, "Ring", OUI_RING},
+    {{0x34, 0x3E, 0xA4}, "Ring", OUI_RING},
+    {{0x54, 0xE0, 0x19}, "Ring", OUI_RING},
+    {{0x5C, 0x47, 0x5E}, "Ring", OUI_RING},
+    {{0x64, 0x9A, 0x63}, "Ring", OUI_RING},
+    {{0x90, 0x48, 0x6C}, "Ring", OUI_RING},
+    {{0x9C, 0x76, 0x13}, "Ring", OUI_RING},
+    {{0xCC, 0x3B, 0xFB}, "Ring", OUI_RING},
+    {{0xC4, 0xDB, 0xAD}, "Ring", OUI_RING},
+    {{0x24, 0x2B, 0xD6}, "Ring", OUI_RING},
+    {{0x00, 0xB4, 0x63}, "Ring", OUI_RING},
+    {{0x50, 0xE4, 0x67}, "Ring", OUI_RING},
+
+    // ── Pentest hardware (consumed by the Pentest-Gear detector) ────────────
+    // Flipper Devices Inc. own MA-L block (IEEE-verified). Flipper's BLE
+    // service UUIDs / company-ID / name are matched in pentest_detector.
+    {{0x0C, 0xFA, 0x22}, "Flipper", OUI_HACKER},
 
     // ── Drone / UAV makers ──────────────────────────────────────────────────
     // SZ DJI Technology
@@ -80,6 +132,10 @@ const char *ouiClassName(uint8_t klass) {
     case OUI_DRONE: return "DRONE";
     case OUI_IOT: return "IOT";
     case OUI_GENERIC: return "GENERIC";
+    case OUI_ALPR: return "ALPR";
+    case OUI_FLOCK: return "FLOCK";
+    case OUI_RING: return "RING";
+    case OUI_HACKER: return "HACKER";
     default: return "?";
     }
 }
