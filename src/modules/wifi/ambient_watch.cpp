@@ -202,7 +202,28 @@ constexpr size_t THREAT_MAX = 96;
 std::vector<Threat> threats;
 int cursor = 0, scroll = 0;
 
+// ALERT FILTER: minimum confidence a hit needs to show in the list and raise the
+// alert banner. Cycled with SEL. Default MED so low-confidence noise stays quiet.
+uint8_t alertFilter = cs::CONF_MED;
+const char *filterName(uint8_t f) { return f == cs::CONF_HIGH ? "High" : f == cs::CONF_MED ? "Med+" : "All"; }
+
+// Transient alert banner (set on a qualifying hit, auto-clears).
+char alertKind[12] = {0};
+char alertLabel[28] = {0};
+int8_t alertRssi = 0;
+uint32_t alertUntil = 0;
+constexpr uint32_t ALERT_MS = 4000;
+
+void raiseAlert(const Event &ev) {
+    if (ev.hit.conf < alertFilter) return;
+    strlcpy(alertKind, ev.hit.kind, sizeof(alertKind));
+    strlcpy(alertLabel, ev.hit.label, sizeof(alertLabel));
+    alertRssi = ev.rssi;
+    alertUntil = millis() + ALERT_MS;
+}
+
 void onEvent(const Event &ev) {
+    raiseAlert(ev);
     for (auto &t : threats) {
         if (t.ble == ev.ble && strcmp(t.addr, ev.addr) == 0 && strcmp(t.kind, ev.hit.kind) == 0) {
             t.rssi = ev.rssi;
@@ -276,19 +297,27 @@ void drawChrome(bool blePhase, uint8_t ch) {
         tft.drawString(l0, 4, 2);
     }
     int hi = highCount();
-    char l1[64];
-    snprintf(l1, sizeof(l1), "threats:%u  high:%d  drop:%lu", (unsigned)threats.size(), hi,
-             (unsigned long)ringDropped);
+    bool alerting = (int32_t)(millis() - alertUntil) < 0 && alertKind[0];
+    char l1[72];
+    uint16_t l1fg;
+    if (alerting) {
+        snprintf(l1, sizeof(l1), "! %s %s %d", alertKind, alertLabel, alertRssi);
+        l1fg = TFT_RED;
+    } else {
+        snprintf(l1, sizeof(l1), "threats:%u high:%d filt:%s drop:%lu", (unsigned)threats.size(), hi,
+                 filterName(alertFilter), (unsigned long)ringDropped);
+        l1fg = hi > 0 ? TFT_RED : (threats.empty() ? TFT_GREEN : TFT_YELLOW);
+    }
     if (chromeCache[1] != l1) {
         chromeCache[1] = l1;
         tft.fillRect(0, 13, tftWidth, 12, TFT_BLACK);
-        tft.setTextColor(hi > 0 ? TFT_RED : (threats.empty() ? TFT_GREEN : TFT_YELLOW), TFT_BLACK);
+        tft.setTextColor(l1fg, TFT_BLACK);
         tft.drawString(l1, 4, 14);
         tft.drawFastHLine(0, CHROME_H - 2, tftWidth, TFT_DARKGREY);
     }
 }
 void drawFooter() {
-    String hint = "^v select  <-exit";
+    String hint = "SEL filter  ^v select  <-exit";
     if (footerCache == hint) return;
     footerCache = hint;
     tft.fillRect(0, tftHeight - FOOTER_H, tftWidth, FOOTER_H, TFT_BLACK);
@@ -306,8 +335,10 @@ void awDraw(bool blePhase, uint8_t ch) {
     int rows = (tftHeight - CHROME_H - FOOTER_H) / ROW_H;
     if (rows > MAX_ROWS) rows = MAX_ROWS;
 
-    std::vector<int> idx(threats.size());
-    for (size_t i = 0; i < threats.size(); i++) idx[i] = (int)i;
+    std::vector<int> idx;
+    idx.reserve(threats.size());
+    for (size_t i = 0; i < threats.size(); i++)
+        if (threats[i].conf >= alertFilter) idx.push_back((int)i); // ALERT FILTER gates the list
     std::sort(idx.begin(), idx.end(), [&](int a, int b) {
         if (threats[a].conf != threats[b].conf) return threats[a].conf > threats[b].conf;
         return threats[a].bestRssi > threats[b].bestRssi;
@@ -380,6 +411,9 @@ void ambient_watch() {
     ringHead = ringTail = ringDropped = 0;
     wifiFrames = 0;
     cursor = scroll = 0;
+    alertFilter = cs::CONF_MED;
+    alertUntil = 0;
+    alertKind[0] = 0;
     fullClear = true;
 
     wifi_mode_t prevMode = WiFi.getMode();
@@ -421,10 +455,18 @@ void ambient_watch() {
             }
             phaseStart = millis();
             lastHop = millis();
-            fullClear = true;
+            // No fullClear here: the threat list + any active alert must stay on
+            // screen across a phase switch. Per-row diffing repaints only the one
+            // changed header line (the [BLE]/[WIFI] indicator), no flash.
             Serial.printf("[Watch] phase -> %s\n", blePhase ? "BLE" : "WIFI");
         }
 
+        if (check(SelPress)) {
+            alertFilter = (alertFilter + 1) % 3; // All -> Med+ -> High -> All
+            cursor = scroll = 0;
+            fullClear = true;
+            Serial.printf("[Watch] filter -> %s\n", filterName(alertFilter));
+        }
         if (check(PrevPress) && cursor > 0) cursor--;
         if (check(NextPress)) cursor++;
 
