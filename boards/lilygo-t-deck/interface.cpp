@@ -68,7 +68,10 @@ void ISR_rst() {
 ***************************************************************************************/
 void _setup_gpio() {
     delay(500); // time to ESP32C3 start and enable the keyboard
-    if (!Wire.begin(KB_I2C_SDA, KB_I2C_SCL)) Serial.println("Fail starting ESP32-C3 keyboard");
+    // Keyboard + GT911 touch live on Wire1 (a dedicated I2C peripheral), NOT the default Wire.
+    // Bruce modules (PN532 NFC, i2c_finder scanner, srix_tool, i2c_js) re-Wire.begin() the default
+    // bus on their own pins; keeping KB/touch on Wire would then kill both until reboot (issue #2764).
+    if (!Wire1.begin(KB_I2C_SDA, KB_I2C_SCL)) Serial.println("Fail starting ESP32-C3 keyboard");
 
     pinMode(PIN_POWER_ON, OUTPUT);
     digitalWrite(PIN_POWER_ON, HIGH);
@@ -76,7 +79,7 @@ void _setup_gpio() {
 
     pinMode(BOARD_TOUCH_INT, INPUT);
     touch.setPins(-1, BOARD_TOUCH_INT);
-    if (!touch.begin(Wire, GT911_SLAVE_ADDRESS_L)) {
+    if (!touch.begin(Wire1, GT911_SLAVE_ADDRESS_L)) {
         Serial.println("Failed to find GT911 - check your wiring!");
     }
     // Set touch max xy
@@ -176,9 +179,9 @@ void InputHandler(void) {
     }
     if (bruceConfig.touchEnabled) touched = touch.getPoint(&t.x, &t.y);
     delay(1);
-    Wire.requestFrom(LILYGO_KB_SLAVE_ADDRESS, 1);
-    while (Wire.available() > 0) {
-        keyValue = Wire.read();
+    Wire1.requestFrom(LILYGO_KB_SLAVE_ADDRESS, 1);
+    while (Wire1.available() > 0) {
+        keyValue = Wire1.read();
         delay(1);
     }
     if (millis() - tm < 200 && !LongPress) return;
