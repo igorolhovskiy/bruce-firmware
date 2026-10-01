@@ -4,9 +4,11 @@
 #include "core/mykeyboard.h"
 #include "cs_classify.h"
 #include "modules/ble/ble_common.h"
+#include "oui_db.h"
 #include <NimBLEDevice.h>
 #include <WiFi.h>
 #include <algorithm>
+#include <stdarg.h>
 #include <esp_wifi.h>
 #include <globals.h>
 #include <vector>
@@ -23,18 +25,32 @@
 namespace {
 
 // ── Unified threat event (callback -> ring) ──────────────────────────────────
+// Besides the hit itself, an event carries the raw evidence (SSID / BLE name,
+// channel, frame type, BLE company + service UUIDs) for the details view.
+enum FrameType : uint8_t { FR_PROBE_REQ = 0, FR_BEACON, FR_PROBE_RESP, FR_BLE_ADV };
+constexpr size_t MAX_SVC = 4;
 struct Event {
     char addr[18];
+    char name[33]; // WiFi SSID / BLE advertised name ("" if none)
     int8_t rssi;
     bool ble;
+    uint8_t ch;    // WiFi channel (0 for BLE)
+    uint8_t frame; // FrameType
+    uint8_t addrType;
+    uint8_t nSvc;
+    uint16_t company; // 0xFFFF = none
+    uint16_t svc[MAX_SVC];
     cs::Hit hit;
 };
+// The ring lives in PSRAM next to the threat table (see allocThreats): with the
+// evidence fields it is ~5 KB, too much to park in internal RAM.
 constexpr size_t RING_SZ = 48;
-Event ring[RING_SZ];
+Event *ring = nullptr;
 volatile uint16_t ringHead = 0, ringTail = 0;
 volatile uint32_t ringDropped = 0;
 
 void ringPush(const Event &e) {
+    if (!ring) return;
     uint16_t next = (ringHead + 1) % RING_SZ;
     if (next == ringTail) {
         ringDropped = ringDropped + 1;
@@ -44,7 +60,7 @@ void ringPush(const Event &e) {
     ringHead = next;
 }
 bool ringPop(Event &e) {
-    if (ringTail == ringHead) return false;
+    if (!ring || ringTail == ringHead) return false;
     e = ring[ringTail];
     ringTail = (ringTail + 1) % RING_SZ;
     return true;
@@ -90,13 +106,16 @@ void wifi_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     const uint8_t *mac;
     char ssid[33] = {0};
     bool beacon = false;
+    uint8_t frame;
     if (subtype == 0x04) {
         mac = p + 10;
         extractSsid(p, len, 24, ssid);
+        frame = FR_PROBE_REQ;
     } else if (subtype == 0x08 || subtype == 0x05) {
         mac = p + 16;
         extractSsid(p, len, 36, ssid);
         beacon = true;
+        frame = subtype == 0x08 ? FR_BEACON : FR_PROBE_RESP;
     } else {
         return;
     }
@@ -108,8 +127,12 @@ void wifi_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 
     Event e = {};
     macStr(mac, e.addr);
+    strlcpy(e.name, ssid, sizeof(e.name));
     e.rssi = pkt->rx_ctrl.rssi;
     e.ble = false;
+    e.ch = pkt->rx_ctrl.channel;
+    e.frame = frame;
+    e.company = 0xFFFF;
     e.hit = h;
     ringPush(e);
 }
@@ -162,7 +185,7 @@ size_t bleExtractSvc(const uint8_t *pl, size_t n, uint16_t *out, size_t cap) {
 class WatchBleCb : public NimBLEScanCallbacks {
     void onResult(const NimBLEAdvertisedDevice *dev) override {
         const std::vector<uint8_t> &pl = dev->getPayload();
-        char name[24];
+        char name[33];
         bleExtractName(pl.data(), pl.size(), name, sizeof(name));
         uint16_t company = bleExtractCompany(pl.data(), pl.size());
         uint16_t svc[8];
@@ -179,8 +202,14 @@ class WatchBleCb : public NimBLEScanCallbacks {
         if (!h.hit) return;
         Event e = {};
         strlcpy(e.addr, a.c_str(), sizeof(e.addr));
+        strlcpy(e.name, name, sizeof(e.name));
         e.rssi = dev->getRSSI();
         e.ble = true;
+        e.frame = FR_BLE_ADV;
+        e.addrType = at;
+        e.company = company;
+        e.nSvc = nSvc > MAX_SVC ? MAX_SVC : nSvc;
+        for (size_t i = 0; i < e.nSvc; i++) e.svc[i] = svc[i];
         e.hit = h;
         ringPush(e);
     }
@@ -192,11 +221,19 @@ struct Threat {
     char addr[18];
     char kind[12];
     char label[28];
+    char name[33]; // last non-empty SSID / BLE name seen
     uint8_t conf;
+    uint8_t why;
+    uint16_t whyArg;
     bool ble;
-    int8_t rssi, bestRssi;
+    int8_t rssi, bestRssi, worstRssi;
+    int32_t rssiSum;
     uint16_t count;
-    uint32_t lastMs;
+    uint32_t firstMs, lastMs;
+    uint8_t ch, frame, addrType, nSvc;
+    uint16_t chMask; // bit n = heard on WiFi channel n
+    uint16_t company;
+    uint16_t svc[MAX_SVC];
 };
 // The threat table lives in PSRAM where the board has it. Once the BLE stack is
 // up, the T-Deck's *internal* heap is down to ~9 KB (NimBLE costs ~106 KB), and
@@ -211,21 +248,36 @@ Threat *threats = nullptr;
 size_t threatCount = 0;
 int cursor = 0, scroll = 0;
 
-bool allocThreats() {
-    if (threats) return true;
-    size_t bytes = THREAT_MAX * sizeof(Threat);
-    threats = (Threat *)(psramFound() ? ps_malloc(bytes) : malloc(bytes));
-    if (threats) memset(threats, 0, bytes);
-    return threats != nullptr;
+// Details view text, rebuilt per frame (also PSRAM: ~2 KB).
+constexpr int DL_MAX = 36;
+constexpr size_t DL_SZ = 56;
+char (*dLines)[DL_SZ] = nullptr;
+
+void *bigAlloc(size_t bytes) {
+    void *p = psramFound() ? ps_malloc(bytes) : malloc(bytes);
+    if (p) memset(p, 0, bytes);
+    return p;
 }
 void freeThreats() {
     free(threats);
+    free(ring);
+    free(dLines);
     threats = nullptr;
+    ring = nullptr;
+    dLines = nullptr;
     threatCount = 0;
+}
+bool allocThreats() {
+    if (!threats) threats = (Threat *)bigAlloc(THREAT_MAX * sizeof(Threat));
+    if (!ring) ring = (Event *)bigAlloc(RING_SZ * sizeof(Event));
+    if (!dLines) dLines = (char (*)[DL_SZ])bigAlloc(DL_MAX * DL_SZ);
+    if (threats && ring && dLines) return true;
+    freeThreats();
+    return false;
 }
 
 // ALERT FILTER: minimum confidence a hit needs to show in the list and raise the
-// alert banner. Cycled with SEL. Default MED so low-confidence noise stays quiet.
+// alert banner. Cycled with the 'f' key. Default MED so low-confidence noise stays quiet.
 uint8_t alertFilter = cs::CONF_MED;
 const char *filterName(uint8_t f) { return f == cs::CONF_HIGH ? "High" : f == cs::CONF_MED ? "Med+" : "All"; }
 
@@ -244,6 +296,23 @@ void raiseAlert(const Event &ev) {
     alertUntil = millis() + ALERT_MS;
 }
 
+// Refresh the evidence fields of a row from its latest event.
+void absorbEvidence(Threat &t, const Event &ev) {
+    if (ev.name[0]) strlcpy(t.name, ev.name, sizeof(t.name));
+    t.frame = ev.frame;
+    if (ev.ble) {
+        t.addrType = ev.addrType;
+        if (ev.company != 0xFFFF) t.company = ev.company;
+        if (ev.nSvc) {
+            t.nSvc = ev.nSvc;
+            for (size_t i = 0; i < ev.nSvc; i++) t.svc[i] = ev.svc[i];
+        }
+    } else if (ev.ch > 0 && ev.ch < 16) {
+        t.ch = ev.ch;
+        t.chMask |= (uint16_t)(1u << ev.ch);
+    }
+}
+
 void onEvent(const Event &ev) {
     raiseAlert(ev);
     if (!threats) return;
@@ -252,8 +321,17 @@ void onEvent(const Event &ev) {
         if (t.ble == ev.ble && strcmp(t.addr, ev.addr) == 0 && strcmp(t.kind, ev.hit.kind) == 0) {
             t.rssi = ev.rssi;
             if (ev.rssi > t.bestRssi) t.bestRssi = ev.rssi;
-            if (t.count < 0xFFFF) t.count++;
-            if (ev.hit.conf > t.conf) t.conf = ev.hit.conf;
+            if (ev.rssi < t.worstRssi) t.worstRssi = ev.rssi;
+            if (t.count < 0xFFFF) {
+                t.count++;
+                t.rssiSum += ev.rssi;
+            }
+            if (ev.hit.conf > t.conf) { // a stronger rule fired: it is now the reason
+                t.conf = ev.hit.conf;
+                t.why = ev.hit.why;
+                t.whyArg = ev.hit.whyArg;
+            }
+            absorbEvidence(t, ev);
             t.lastMs = millis();
             return;
         }
@@ -269,10 +347,15 @@ void onEvent(const Event &ev) {
     strlcpy(t.kind, ev.hit.kind, sizeof(t.kind));
     strlcpy(t.label, ev.hit.label, sizeof(t.label));
     t.conf = ev.hit.conf;
+    t.why = ev.hit.why;
+    t.whyArg = ev.hit.whyArg;
     t.ble = ev.ble;
-    t.rssi = t.bestRssi = ev.rssi;
+    t.rssi = t.bestRssi = t.worstRssi = ev.rssi;
+    t.rssiSum = ev.rssi;
     t.count = 1;
-    t.lastMs = millis();
+    t.company = 0xFFFF;
+    absorbEvidence(t, ev);
+    t.firstMs = t.lastMs = millis();
     threats[slot] = t;
     if (threatCount < THREAT_MAX) threatCount++;
     Serial.printf("[Watch] %s HIT %s %s \"%s\" rssi=%d conf=%s\n", ev.ble ? "BLE" : "WIFI", ev.hit.kind,
@@ -290,8 +373,20 @@ constexpr size_t ROW_CACHE_SZ = 56;
 char rowCache[MAX_ROWS][ROW_CACHE_SZ];
 uint16_t rowFgCache[MAX_ROWS];
 char chromeCache[2][80];
-bool footerDrawn = false;
+const char *footerDrawn = nullptr; // hint currently on screen
 bool fullClear = true;
+
+// Details view state. The open row is pinned by slot AND identity (addr, kind,
+// firstMs) so a slot recycled by a full table is noticed, not misreported.
+bool detailOpen = false;
+int detailSlot = -1;
+char detailAddr[18], detailKind[12];
+uint32_t detailFirstMs = 0;
+int detailScroll = 0;
+
+// Sorted, filtered view of the table as last drawn; maps cursor -> slot.
+int16_t listIdx[THREAT_MAX];
+int listTotal = 0;
 
 void resetCache() {
     for (int i = 0; i < MAX_ROWS; i++) {
@@ -303,7 +398,7 @@ void resetCache() {
         chromeCache[i][0] = '\x01';
         chromeCache[i][1] = 0;
     }
-    footerDrawn = false;
+    footerDrawn = nullptr;
 }
 void drawRow(int slot, int y, const char *text, uint16_t fg) {
     if (slot < 0 || slot >= MAX_ROWS) return;
@@ -352,15 +447,170 @@ void drawChrome(bool blePhase, uint8_t ch) {
         tft.drawFastHLine(0, CHROME_H - 2, tftWidth, TFT_DARKGREY);
     }
 }
-void drawFooter() {
-    static const char *hint = "SEL filter  ^v select  <-exit";
-    if (footerDrawn) return;
-    footerDrawn = true;
+void drawFooter(const char *hint) {
+    if (footerDrawn == hint) return;
+    footerDrawn = hint;
     tft.fillRect(0, tftHeight - FOOTER_H, tftWidth, FOOTER_H, TFT_BLACK);
     tft.setTextSize(FP);
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
     tft.drawString(hint, 4, tftHeight - FOOTER_H + 1);
 }
+int bodyRows() {
+    int rows = (tftHeight - CHROME_H - FOOTER_H) / ROW_H;
+    return rows > MAX_ROWS ? MAX_ROWS : rows;
+}
+
+// ── Details view ─────────────────────────────────────────────────────────────
+uint16_t dFg[DL_MAX];
+int dCount = 0;
+constexpr int DL_COLS = 52; // 6 px glyphs across 320 - 4 px margin
+
+void dAdd(uint16_t fg, const char *fmt, ...) {
+    if (dCount >= DL_MAX) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(dLines[dCount], DL_SZ, fmt, ap);
+    va_end(ap);
+    dFg[dCount++] = fg;
+}
+// Word-wrap `text` into lines of DL_COLS, each prefixed by `indent` spaces.
+void dWrap(uint16_t fg, const char *text, int indent) {
+    int width = DL_COLS - indent;
+    const char *p = text;
+    while (*p && dCount < DL_MAX) {
+        while (*p == ' ') p++;
+        int n = strlen(p);
+        if (n > width) {
+            n = width;
+            while (n > 0 && p[n] != ' ') n--;
+            if (n == 0) n = width; // one unbreakable word
+        }
+        dAdd(fg, "%*s%.*s", indent, "", n, p);
+        p += n;
+    }
+}
+void fmtAgo(uint32_t ms, char *out, size_t n) {
+    uint32_t s = ms / 1000;
+    if (s < 60) snprintf(out, n, "%lus", (unsigned long)s);
+    else if (s < 3600) snprintf(out, n, "%lum%02lus", (unsigned long)(s / 60), (unsigned long)(s % 60));
+    else snprintf(out, n, "%luh%02lum", (unsigned long)(s / 3600), (unsigned long)(s / 60 % 60));
+}
+const char *proximity(int rssi) {
+    if (rssi >= -50) return "very close (a few metres)";
+    if (rssi >= -65) return "near (same room / ~10 m)";
+    if (rssi >= -80) return "medium (~10-30 m)";
+    return "far / behind walls";
+}
+const char *frameName(uint8_t f) {
+    switch (f) {
+    case FR_PROBE_REQ: return "probe request (client searching)";
+    case FR_BEACON: return "beacon (access point)";
+    case FR_PROBE_RESP: return "probe response (access point)";
+    default: return "advertisement";
+    }
+}
+const char *confMeaning(uint8_t c) {
+    if (c == cs::CONF_HIGH) return "Strong, specific signature - very likely what it says.";
+    if (c == cs::CONF_MED) return "Likely, but based on a name or a shared ID - verify.";
+    return "Weak hint only - often a false positive.";
+}
+uint16_t confColor(uint8_t c) {
+    return c == cs::CONF_HIGH ? TFT_RED : c == cs::CONF_MED ? TFT_YELLOW : TFT_DARKGREY;
+}
+
+void buildDetails() {
+    dCount = 0;
+    const Threat *tp = nullptr;
+    if (detailSlot >= 0 && (size_t)detailSlot < threatCount) {
+        const Threat &c = threats[detailSlot];
+        if (c.firstMs == detailFirstMs && !strcmp(c.addr, detailAddr) && !strcmp(c.kind, detailKind)) tp = &c;
+    }
+    if (!tp) {
+        dAdd(TFT_YELLOW, "%s %s", detailKind, detailAddr);
+        dAdd(TFT_DARKGREY, "This record was recycled: the table filled up");
+        dAdd(TFT_DARKGREY, "(%u rows) and it was the least recently seen.", (unsigned)THREAT_MAX);
+        return;
+    }
+    const Threat &t = *tp;
+    uint32_t now = millis();
+    char buf[200];
+
+    dAdd(confColor(t.conf), "%s  [%s]  via %s", t.kind, cs::confName(t.conf), t.ble ? "BLE" : "WiFi");
+    dAdd(TFT_WHITE, " %s", cs::kindDescription(t.kind));
+
+    uint8_t mac[6] = {0};
+    unsigned v[6];
+    bool macOk = sscanf(t.addr, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6;
+    if (macOk)
+        for (int i = 0; i < 6; i++) mac[i] = (uint8_t)v[i];
+    if (t.ble)
+        dAdd(TFT_WHITE, "Address : %s (%s)", t.addr,
+             t.addrType == 0 ? "public" : t.addrType == 1 ? "random" : "other");
+    else dAdd(TFT_WHITE, "Address : %s", t.addr);
+    const OuiEntry *o = macOk ? lookupOui(mac) : nullptr;
+    bool randomMac = t.ble ? t.addrType != 0 : (mac[0] & 0x02);
+    if (o) dAdd(TFT_WHITE, "Vendor  : %.30s [%s]", o->vendor, ouiClassName(o->klass));
+    else if (randomMac) dAdd(TFT_DARKGREY, "Vendor  : n/a (randomized / private address)");
+    else dAdd(TFT_DARKGREY, "Vendor  : not in built-in OUI database");
+    dAdd(TFT_WHITE, "Label   : %s", t.label);
+    if (t.ble) dAdd(TFT_WHITE, "Name    : %s", t.name[0] ? t.name : "(not advertised)");
+    else if (t.frame == FR_PROBE_REQ)
+        dAdd(TFT_WHITE, "Looking : %s", t.name[0] ? t.name : "(any network / wildcard)");
+    else dAdd(TFT_WHITE, "SSID    : %s", t.name[0] ? t.name : "(hidden)");
+
+    if (t.ble) {
+        if (t.company != 0xFFFF) dAdd(TFT_WHITE, "Company : 0x%04X (manufacturer data)", t.company);
+        else dAdd(TFT_DARKGREY, "Company : none advertised");
+        if (t.nSvc) {
+            int n = snprintf(buf, sizeof(buf), "Services:");
+            for (int i = 0; i < t.nSvc; i++) n += snprintf(buf + n, sizeof(buf) - n, " %04X", t.svc[i]);
+            dAdd(TFT_WHITE, "%s", buf);
+        } else dAdd(TFT_DARKGREY, "Services: none advertised (16-bit)");
+        dAdd(TFT_WHITE, "Frame   : %s", frameName(t.frame));
+    } else {
+        int n = snprintf(buf, sizeof(buf), "Channel : %u  (heard on", t.ch);
+        for (int c = 1; c < 16; c++)
+            if (t.chMask & (1u << c)) n += snprintf(buf + n, sizeof(buf) - n, " %d", c);
+        snprintf(buf + n, sizeof(buf) - n, ")");
+        dAdd(TFT_WHITE, "%s", buf);
+        dAdd(TFT_WHITE, "Frame   : %s", frameName(t.frame));
+    }
+
+    int avg = t.count ? (int)(t.rssiSum / t.count) : t.rssi;
+    dAdd(TFT_CYAN, "RSSI dBm: now %d  best %d  worst %d  avg %d", t.rssi, t.bestRssi, t.worstRssi, avg);
+    dAdd(TFT_CYAN, "Distance: %s", proximity(t.bestRssi));
+    char first[16], last[16];
+    fmtAgo(now - t.firstMs, first, sizeof(first));
+    fmtAgo(now - t.lastMs, last, sizeof(last));
+    dAdd(TFT_WHITE, "Seen    : %ux, first %s ago, last %s ago", t.count, first, last);
+    if (now - t.lastMs > 60000)
+        dAdd(TFT_DARKGREY, " (not heard for a while - out of range or off)");
+
+    dAdd(TFT_DARKGREY, "--- Why it is on the list ---");
+    cs::explainWhy(t.why, t.whyArg, buf, sizeof(buf));
+    dWrap(TFT_YELLOW, buf, 1);
+    dAdd(confColor(t.conf), "Confidence %s:", cs::confName(t.conf));
+    dWrap(TFT_WHITE, confMeaning(t.conf), 1);
+    if (t.ble && t.addrType != 0)
+        dWrap(TFT_DARKGREY, "Random BLE addresses rotate every few minutes, so one device can appear "
+                            "as several rows over time.", 1);
+}
+
+void drawDetails() {
+    buildDetails();
+    int rows = bodyRows();
+    int maxScroll = dCount > rows ? dCount - rows : 0;
+    if (detailScroll > maxScroll) detailScroll = maxScroll;
+    if (detailScroll < 0) detailScroll = 0;
+    for (int slot = 0; slot < rows; slot++) {
+        int li = detailScroll + slot;
+        int y = CHROME_H + slot * ROW_H;
+        if (li < dCount) drawRow(slot, y, dLines[li], dFg[li]);
+        else drawRow(slot, y, "", TFT_WHITE);
+    }
+    drawFooter(maxScroll ? "<-/b back  ^v scroll  (scan keeps running)" : "<-/b back  (scan keeps running)");
+}
+
 void awDraw(bool blePhase, uint8_t ch) {
     if (fullClear) {
         tft.fillScreen(TFT_BLACK);
@@ -368,10 +618,13 @@ void awDraw(bool blePhase, uint8_t ch) {
         fullClear = false;
     }
     drawChrome(blePhase, ch);
-    int rows = (tftHeight - CHROME_H - FOOTER_H) / ROW_H;
-    if (rows > MAX_ROWS) rows = MAX_ROWS;
+    if (detailOpen) {
+        drawDetails();
+        return;
+    }
+    int rows = bodyRows();
 
-    static int16_t idx[THREAT_MAX]; // fixed: this ran per frame as a heap vector
+    int16_t *idx = listIdx;
     int total = 0;
     for (size_t i = 0; i < threatCount; i++)
         if (threats[i].conf >= alertFilter) idx[total++] = (int16_t)i; // ALERT FILTER gates the list
@@ -405,7 +658,30 @@ void awDraw(bool blePhase, uint8_t ch) {
                                                 : TFT_DARKGREY;
         drawRow(slot, y, line, fg);
     }
-    drawFooter();
+    listTotal = total;
+    drawFooter("SEL details  f filter  ^v select  <-exit");
+}
+
+void openDetails() {
+    if (cursor < 0 || cursor >= listTotal) return;
+    int slot = listIdx[cursor];
+    const Threat &t = threats[slot];
+    detailOpen = true;
+    detailSlot = slot;
+    strlcpy(detailAddr, t.addr, sizeof(detailAddr));
+    strlcpy(detailKind, t.kind, sizeof(detailKind));
+    detailFirstMs = t.firstMs;
+    detailScroll = 0;
+    Serial.printf("[Watch] details -> %s %s\n", t.kind, t.addr);
+}
+void closeDetails() {
+    detailOpen = false;
+    Serial.println("[Watch] details closed -> list");
+}
+void cycleFilter() {
+    alertFilter = (alertFilter + 1) % 3; // All -> Med+ -> High -> All
+    cursor = scroll = 0;
+    Serial.printf("[Watch] filter -> %s\n", filterName(alertFilter));
 }
 
 // ── Radio phase control ──────────────────────────────────────────────────────
@@ -450,6 +726,16 @@ void stopBlePhase() {
     stopBLEStack();
 }
 
+// Last typed character on keyboard boards, 0 if none. (Backspace needs no
+// handling here: the board's input handler already turns it into EscPress.)
+char typedKey() {
+#ifdef HAS_KEYBOARD
+    keyStroke k = _getKeyPress();
+    if (k.pressed && !k.word.empty()) return k.word[0];
+#endif
+    return 0;
+}
+
 } // namespace
 
 void ambient_watch() {
@@ -465,6 +751,8 @@ void ambient_watch() {
     ringHead = ringTail = ringDropped = 0;
     wifiFrames = 0;
     cursor = scroll = 0;
+    listTotal = 0;
+    detailOpen = false;
     alertFilter = cs::CONF_MED;
     alertUntil = 0;
     alertKind[0] = 0;
@@ -482,7 +770,12 @@ void ambient_watch() {
     uint32_t phaseStart = millis(), lastHop = millis();
     awDraw(blePhase, wifi_channels[chIdx]);
 
-    while (!check(EscPress)) {
+    for (;;) {
+        // Backspace raises EscPress: back to the list from details, exit from the list.
+        if (check(EscPress)) {
+            if (!detailOpen) break;
+            closeDetails();
+        }
         Event ev;
         int drained = 0;
         while (drained++ < 32 && ringPop(ev)) onEvent(ev);
@@ -515,14 +808,22 @@ void ambient_watch() {
             Serial.printf("[Watch] phase -> %s\n", blePhase ? "BLE" : "WIFI");
         }
 
-        if (check(SelPress)) {
-            alertFilter = (alertFilter + 1) % 3; // All -> Med+ -> High -> All
-            cursor = scroll = 0;
-            fullClear = true;
-            Serial.printf("[Watch] filter -> %s\n", filterName(alertFilter));
+        // Input never blocks: events keep draining and phases keep switching
+        // above whichever view is open, so nothing is lost while reading details.
+        char key = typedKey();
+        if (key == 'F') key = 'f';
+        if (key == 'B') key = 'b';
+        if (detailOpen) {
+            if (key == 'b') closeDetails();
+            if (check(PrevPress)) detailScroll--;
+            if (check(NextPress)) detailScroll++;
+            check(SelPress); // swallow: SEL has no meaning here
+        } else {
+            if (key == 'f') cycleFilter();
+            if (check(SelPress)) openDetails();
+            if (check(PrevPress) && cursor > 0) cursor--;
+            if (check(NextPress)) cursor++;
         }
-        if (check(PrevPress) && cursor > 0) cursor--;
-        if (check(NextPress)) cursor++;
 
         awDraw(blePhase, wifi_channels[chIdx]);
         delay(15);
