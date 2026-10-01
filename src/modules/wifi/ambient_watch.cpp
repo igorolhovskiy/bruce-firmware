@@ -198,9 +198,31 @@ struct Threat {
     uint16_t count;
     uint32_t lastMs;
 };
+// The threat table lives in PSRAM where the board has it. Once the BLE stack is
+// up, the T-Deck's *internal* heap is down to ~9 KB (NimBLE costs ~106 KB), and
+// Arduino keeps allocations under 4 KB internal even with PSRAM fitted. A growing
+// std::vector<Threat> had to hold the old and new buffers side by side on that
+// heap while doubling -- ~11 KB for the last step. That allocation fails, and a
+// failed operator new calls abort(), which is what rebooted the device back to
+// the main menu part-way through a watch. One fixed block never reallocs, and in
+// PSRAM it costs the internal heap nothing.
 constexpr size_t THREAT_MAX = 96;
-std::vector<Threat> threats;
+Threat *threats = nullptr;
+size_t threatCount = 0;
 int cursor = 0, scroll = 0;
+
+bool allocThreats() {
+    if (threats) return true;
+    size_t bytes = THREAT_MAX * sizeof(Threat);
+    threats = (Threat *)(psramFound() ? ps_malloc(bytes) : malloc(bytes));
+    if (threats) memset(threats, 0, bytes);
+    return threats != nullptr;
+}
+void freeThreats() {
+    free(threats);
+    threats = nullptr;
+    threatCount = 0;
+}
 
 // ALERT FILTER: minimum confidence a hit needs to show in the list and raise the
 // alert banner. Cycled with SEL. Default MED so low-confidence noise stays quiet.
@@ -224,7 +246,9 @@ void raiseAlert(const Event &ev) {
 
 void onEvent(const Event &ev) {
     raiseAlert(ev);
-    for (auto &t : threats) {
+    if (!threats) return;
+    for (size_t i = 0; i < threatCount; i++) {
+        Threat &t = threats[i];
         if (t.ble == ev.ble && strcmp(t.addr, ev.addr) == 0 && strcmp(t.kind, ev.hit.kind) == 0) {
             t.rssi = ev.rssi;
             if (ev.rssi > t.bestRssi) t.bestRssi = ev.rssi;
@@ -234,11 +258,11 @@ void onEvent(const Event &ev) {
             return;
         }
     }
-    if (threats.size() >= THREAT_MAX) {
-        size_t oldest = 0;
-        for (size_t i = 1; i < threats.size(); i++)
-            if (threats[i].lastMs < threats[oldest].lastMs) oldest = i;
-        threats.erase(threats.begin() + oldest);
+    size_t slot = threatCount;
+    if (slot >= THREAT_MAX) { // table full: recycle the least recently seen row
+        slot = 0;
+        for (size_t i = 1; i < THREAT_MAX; i++)
+            if (threats[i].lastMs < threats[slot].lastMs) slot = i;
     }
     Threat t = {};
     strlcpy(t.addr, ev.addr, sizeof(t.addr));
@@ -249,30 +273,42 @@ void onEvent(const Event &ev) {
     t.rssi = t.bestRssi = ev.rssi;
     t.count = 1;
     t.lastMs = millis();
-    threats.push_back(t);
+    threats[slot] = t;
+    if (threatCount < THREAT_MAX) threatCount++;
     Serial.printf("[Watch] %s HIT %s %s \"%s\" rssi=%d conf=%s\n", ev.ble ? "BLE" : "WIFI", ev.hit.kind,
                   ev.addr, ev.hit.label, ev.rssi, cs::confName(ev.hit.conf));
 }
 
 // ── Rendering (per-row diffed) ───────────────────────────────────────────────
+// Row/chrome caches are plain char buffers, and drawRow takes a const char*.
+// They used to be Arduino Strings: every drawRow() call built a String temporary
+// on the internal heap whether or not the row had changed -- ~1200 allocations a
+// second against a 9 KB pool, fragmenting it under the threat table's growth.
+// Now a repaint is the only thing that allocates (tft.drawString takes a String).
 constexpr int CHROME_H = 26, FOOTER_H = 12, ROW_H = 11, MAX_ROWS = 18;
-String rowCache[MAX_ROWS];
+constexpr size_t ROW_CACHE_SZ = 56;
+char rowCache[MAX_ROWS][ROW_CACHE_SZ];
 uint16_t rowFgCache[MAX_ROWS];
-String chromeCache[2], footerCache;
+char chromeCache[2][80];
+bool footerDrawn = false;
 bool fullClear = true;
 
 void resetCache() {
     for (int i = 0; i < MAX_ROWS; i++) {
-        rowCache[i] = "\x01";
+        rowCache[i][0] = '\x01'; // sentinel: matches no real row text
+        rowCache[i][1] = 0;
         rowFgCache[i] = 0xDEAD;
     }
-    chromeCache[0] = chromeCache[1] = "\x01";
-    footerCache = "\x01";
+    for (int i = 0; i < 2; i++) {
+        chromeCache[i][0] = '\x01';
+        chromeCache[i][1] = 0;
+    }
+    footerDrawn = false;
 }
-void drawRow(int slot, int y, const String &text, uint16_t fg) {
+void drawRow(int slot, int y, const char *text, uint16_t fg) {
     if (slot < 0 || slot >= MAX_ROWS) return;
-    if (rowCache[slot] == text && rowFgCache[slot] == fg) return;
-    rowCache[slot] = text;
+    if (strcmp(rowCache[slot], text) == 0 && rowFgCache[slot] == fg) return;
+    strlcpy(rowCache[slot], text, ROW_CACHE_SZ);
     rowFgCache[slot] = fg;
     tft.fillRect(0, y - 1, tftWidth, ROW_H, TFT_BLACK);
     tft.setTextSize(FP);
@@ -281,8 +317,8 @@ void drawRow(int slot, int y, const String &text, uint16_t fg) {
 }
 int highCount() {
     int c = 0;
-    for (auto &t : threats)
-        if (t.conf == cs::CONF_HIGH) c++;
+    for (size_t i = 0; i < threatCount; i++)
+        if (threats[i].conf == cs::CONF_HIGH) c++;
     return c;
 }
 void drawChrome(bool blePhase, uint8_t ch) {
@@ -290,8 +326,8 @@ void drawChrome(bool blePhase, uint8_t ch) {
     char l0[64];
     if (blePhase) snprintf(l0, sizeof(l0), "Ambient Watch  [BLE] scan");
     else snprintf(l0, sizeof(l0), "Ambient Watch  [WIFI] ch%u", ch);
-    if (chromeCache[0] != l0) {
-        chromeCache[0] = l0;
+    if (strcmp(chromeCache[0], l0) != 0) {
+        strlcpy(chromeCache[0], l0, sizeof(chromeCache[0]));
         tft.fillRect(0, 0, tftWidth, 11, TFT_BLACK);
         tft.setTextColor(bruceConfig.priColor, TFT_BLACK);
         tft.drawString(l0, 4, 2);
@@ -304,12 +340,12 @@ void drawChrome(bool blePhase, uint8_t ch) {
         snprintf(l1, sizeof(l1), "! %s %s %d", alertKind, alertLabel, alertRssi);
         l1fg = TFT_RED;
     } else {
-        snprintf(l1, sizeof(l1), "threats:%u high:%d filt:%s drop:%lu", (unsigned)threats.size(), hi,
+        snprintf(l1, sizeof(l1), "threats:%u high:%d filt:%s drop:%lu", (unsigned)threatCount, hi,
                  filterName(alertFilter), (unsigned long)ringDropped);
-        l1fg = hi > 0 ? TFT_RED : (threats.empty() ? TFT_GREEN : TFT_YELLOW);
+        l1fg = hi > 0 ? TFT_RED : (threatCount == 0 ? TFT_GREEN : TFT_YELLOW);
     }
-    if (chromeCache[1] != l1) {
-        chromeCache[1] = l1;
+    if (strcmp(chromeCache[1], l1) != 0) {
+        strlcpy(chromeCache[1], l1, sizeof(chromeCache[1]));
         tft.fillRect(0, 13, tftWidth, 12, TFT_BLACK);
         tft.setTextColor(l1fg, TFT_BLACK);
         tft.drawString(l1, 4, 14);
@@ -317,9 +353,9 @@ void drawChrome(bool blePhase, uint8_t ch) {
     }
 }
 void drawFooter() {
-    String hint = "SEL filter  ^v select  <-exit";
-    if (footerCache == hint) return;
-    footerCache = hint;
+    static const char *hint = "SEL filter  ^v select  <-exit";
+    if (footerDrawn) return;
+    footerDrawn = true;
     tft.fillRect(0, tftHeight - FOOTER_H, tftWidth, FOOTER_H, TFT_BLACK);
     tft.setTextSize(FP);
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
@@ -335,15 +371,14 @@ void awDraw(bool blePhase, uint8_t ch) {
     int rows = (tftHeight - CHROME_H - FOOTER_H) / ROW_H;
     if (rows > MAX_ROWS) rows = MAX_ROWS;
 
-    std::vector<int> idx;
-    idx.reserve(threats.size());
-    for (size_t i = 0; i < threats.size(); i++)
-        if (threats[i].conf >= alertFilter) idx.push_back((int)i); // ALERT FILTER gates the list
-    std::sort(idx.begin(), idx.end(), [&](int a, int b) {
+    static int16_t idx[THREAT_MAX]; // fixed: this ran per frame as a heap vector
+    int total = 0;
+    for (size_t i = 0; i < threatCount; i++)
+        if (threats[i].conf >= alertFilter) idx[total++] = (int16_t)i; // ALERT FILTER gates the list
+    std::sort(idx, idx + total, [&](int16_t a, int16_t b) {
         if (threats[a].conf != threats[b].conf) return threats[a].conf > threats[b].conf;
         return threats[a].bestRssi > threats[b].bestRssi;
     });
-    int total = (int)idx.size();
     if (cursor >= total) cursor = total ? total - 1 : 0;
     if (cursor < 0) cursor = 0;
     if (cursor < scroll) scroll = cursor;
@@ -361,11 +396,9 @@ void awDraw(bool blePhase, uint8_t ch) {
         }
         const Threat &t = threats[idx[li]];
         char cflag = t.conf == cs::CONF_HIGH ? 'H' : t.conf == cs::CONF_MED ? 'M' : 'L';
-        String label = String(t.label);
-        if (label.length() > 14) label = label.substring(0, 14);
-        char line[56];
-        snprintf(line, sizeof(line), "%c%c %s %s %d x%u", li == cursor ? '>' : ' ', cflag,
-                 t.kind, label.c_str(), t.rssi, t.count);
+        char line[ROW_CACHE_SZ];
+        snprintf(line, sizeof(line), "%c%c %s %.14s %d x%u", li == cursor ? '>' : ' ', cflag,
+                 t.kind, t.label, t.rssi, t.count);
         uint16_t fg = li == cursor            ? TFT_CYAN
                       : t.conf == cs::CONF_HIGH ? TFT_RED
                       : t.conf == cs::CONF_MED  ? TFT_YELLOW
@@ -376,6 +409,12 @@ void awDraw(bool blePhase, uint8_t ch) {
 }
 
 // ── Radio phase control ──────────────────────────────────────────────────────
+// Each phase owns the radio AND its memory: the WiFi phase runs with the BLE
+// stack torn down, the BLE phase with WiFi off. ble_scan_setup() only drops WiFi
+// when FORCE_RADIO_TEARDOWN_ON_SWITCH is set, and that is false on this board, so
+// both stacks used to be resident together through the BLE phase -- which is how
+// the internal heap got down to ~9 KB. Alternating them keeps real headroom in
+// both phases; the heap figures in the phase log are there to confirm it.
 void startWifiPhase(uint8_t chIdx) {
     WiFi.mode(WIFI_MODE_STA);
     esp_wifi_set_promiscuous(false);
@@ -385,19 +424,29 @@ void startWifiPhase(uint8_t chIdx) {
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_channel(wifi_channels[chIdx], WIFI_SECOND_CHAN_NONE);
 }
-void stopWifiPhase() {
+void stopWifiPhase(bool releaseStack) {
     esp_wifi_set_promiscuous(false);
     esp_wifi_set_promiscuous_rx_cb(nullptr);
+    if (releaseStack) {
+        WiFi.mode(WIFI_MODE_NULL); // frees the WiFi driver buffers for the BLE phase
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
 }
 void startBlePhase() {
-    ble_scan_setup(); // tears down WiFi, inits BLE
-    pBLEScan->setScanCallbacks(&bleCb, false);
-    pBLEScan->setActiveScan(false);
-    pBLEScan->setMaxResults(0);
+    ble_scan_setup(); // BLEDevice::init + getScan (WiFi is already off)
+    // NOTE: the second argument is wantDuplicates, NOT deleteCallbacks -- it calls
+    // setDuplicateFilter(!wantDuplicates) internally. Passing false here would switch
+    // the controller's duplicate filter ON, and a filtered device is reported once and
+    // then never again, so the watch would quietly stop listing BLE threats.
+    pBLEScan->setScanCallbacks(&bleCb, true);
+    pBLEScan->setActiveScan(false);      // passive: receive-only, never transmit
+    pBLEScan->setMaxResults(0);          // callback-only, don't buffer results
+    pBLEScan->setDuplicateFilter(false); // explicit: keep re-reporting every phase
     pBLEScan->start(0, false);
 }
 void stopBlePhase() {
     if (pBLEScan) pBLEScan->stop();
+    vTaskDelay(20 / portTICK_PERIOD_MS); // let an in-flight onResult() finish
     stopBLEStack();
 }
 
@@ -407,7 +456,12 @@ void ambient_watch() {
     Serial.println("[Watch] Ambient Watch starting (passive, time-sliced WiFi<->BLE)");
     cs::runCsClassifySelfTest();
 
-    threats.clear();
+    if (!allocThreats()) {
+        Serial.println("[Watch] cannot allocate threat table - aborting");
+        displayError("Out of memory", true);
+        return;
+    }
+    threatCount = 0;
     ringHead = ringTail = ringDropped = 0;
     wifiFrames = 0;
     cursor = scroll = 0;
@@ -449,7 +503,7 @@ void ambient_watch() {
                 startWifiPhase(chIdx);
                 blePhase = false;
             } else {
-                stopWifiPhase();
+                stopWifiPhase(true);
                 startBlePhase();
                 blePhase = true;
             }
@@ -475,8 +529,9 @@ void ambient_watch() {
     }
 
     if (blePhase) stopBlePhase();
-    else stopWifiPhase();
+    else stopWifiPhase(false);
+    freeThreats();
     WiFi.mode(prevMode);
     Serial.printf("[Watch] stopped. threats=%u wifiFrames=%lu dropped=%lu\n",
-                  (unsigned)threats.size(), (unsigned long)wifiFrames, (unsigned long)ringDropped);
+                  (unsigned)threatCount, (unsigned long)wifiFrames, (unsigned long)ringDropped);
 }

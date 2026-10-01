@@ -237,7 +237,13 @@ void ble_scan_setup() {
     BLEDevice::init("");
     pBLEScan = BLEDevice::getScan();
 #ifdef NIMBLE_V2_PLUS
-    pBLEScan->setScanCallbacks(new NimBLEScanCallbacks());
+    // NimBLEScan::setScanCallbacks() stores the pointer and never takes ownership
+    // (see NimBLEScan.cpp), so a `new` here is leaked on every call. Harmless for a
+    // detector that sets up once, but Ambient Watch re-runs this on every phase
+    // switch, which turned into a steady drip. A file-static placeholder leaks
+    // nothing; callers that want their own callbacks still override it afterwards.
+    static NimBLEScanCallbacks placeholderScanCallbacks;
+    pBLEScan->setScanCallbacks(&placeholderScanCallbacks);
 #else
     pBLEScan->setAdvertisedDeviceCallbacks(new AdvertisedDeviceCallbacks());
 #endif
