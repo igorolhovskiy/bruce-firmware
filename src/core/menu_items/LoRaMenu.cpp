@@ -5,11 +5,13 @@
 #include "modules/lora/LoRaRF.h"
 #include "modules/lora/LoRaRecon.h"
 #include "modules/lora/Meshtastic.h"
+#include "modules/lora/lora_recon_multi.h"
 
 void LoRaMenu::optionsMenu() {
     options = {
         {"Chat",             []() { lorachat(); }         },
         {"Recon",            []() { loraRecon(); }        },
+        {"Recon Multi",      []() { loraReconMulti(); }   },
         {"Meshtastic",       []() { meshtasticChannel(); }},
         {"Change username",  []() { changeusername(); }   },
         {"Change Frequency", []() { chfreq(); }           },
