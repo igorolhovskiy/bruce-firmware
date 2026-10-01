@@ -80,6 +80,9 @@ JsonDocument BruceConfig::toJson() const {
     JsonArray _camSsidPatterns = setting["camSsidPatterns"].to<JsonArray>();
     for (const auto &p : camSsidPatterns) _camSsidPatterns.add(p);
 
+    JsonArray _camSsidExclude = setting["camSsidExclude"].to<JsonArray>();
+    for (const auto &p : camSsidExclude) _camSsidExclude.add(p);
+
     JsonArray qrArray = setting["qrCodes"].to<JsonArray>();
     for (const auto &entry : qrCodes) {
         JsonObject qrEntry = qrArray.add<JsonObject>();
@@ -437,6 +440,15 @@ void BruceConfig::fromFile(bool checkFS) {
         camSsidPatterns.clear();
         JsonArray cp = setting["camSsidPatterns"].as<JsonArray>();
         for (JsonVariant e : cp) { camSsidPatterns.push_back(e.as<String>()); }
+    } else {
+        count++;
+        log_e("Fail");
+    }
+
+    if (!setting["camSsidExclude"].isNull()) {
+        camSsidExclude.clear();
+        JsonArray ce = setting["camSsidExclude"].as<JsonArray>();
+        for (JsonVariant e : ce) { camSsidExclude.push_back(e.as<String>()); }
     } else {
         count++;
         log_e("Fail");

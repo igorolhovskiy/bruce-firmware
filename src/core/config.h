@@ -107,6 +107,13 @@ public:
         "Nest",     "Camera", "-CAM",  "CAM-",   "Webcam",  "Doorbell",
     };
 
+    // Case-insensitive SSID substrings that SUPPRESS an SSID-based camera match
+    // (e.g. "campus" contains the "CAM-"/"Camera" patterns but is not a camera).
+    // Editable via bruce.conf ("camSsidExclude"); an OUI-based match still flags.
+    std::vector<String> camSsidExclude = {
+        "campus",
+    };
+
     std::vector<QrCodeEntry> qrCodes = {
         {"Bruce AP",   "WIFI:T:WPA;S:BruceNet;P:brucenet;;"},
         {"Bruce Wiki", "https://github.com/pr3y/Bruce/wiki"},

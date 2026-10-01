@@ -49,8 +49,20 @@ bool ciContains(const char *hay, const char *needle) {
     return false;
 }
 
+// SSID-match exclusions: words that contain a camera pattern as a substring but
+// are not cameras (e.g. "Camera"/"CAM-" match "Campus"). Sourced from
+// bruceConfig.camSsidExclude (editable in bruce.conf, "camSsidExclude", seeded
+// with "campus"). An SSID hitting one never counts as an SSID-based camera
+// match; a real camera-vendor OUI still flags regardless.
+bool ssidExcluded(const char *ssid) {
+    for (const auto &ex : bruceConfig.camSsidExclude)
+        if (ciContains(ssid, ex.c_str())) return true;
+    return false;
+}
+
 bool ssidMatchesCamera(const char *ssid) {
     if (!ssid || !ssid[0]) return false;
+    if (ssidExcluded(ssid)) return false;
     for (const auto &pat : bruceConfig.camSsidPatterns)
         if (ciContains(ssid, pat.c_str())) return true;
     return false;
