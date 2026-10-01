@@ -6,6 +6,7 @@
 #include "modules/ble/ble_spy_detector.h"
 #include "modules/ble/pentest_detector.h"
 #include "modules/ble/tracker_detector.h"
+#include "modules/wifi/ambient_watch.h"
 #include "modules/wifi/blockack_detector.h"
 #include "modules/wifi/drone_remoteid.h"
 #include "modules/wifi/follower_scan.h"
@@ -52,6 +53,8 @@ static void counterSurveilAbout() {
 void CounterSurveilMenu::optionsMenu() {
     options.clear();
 
+    // Unified passive watch: time-slices WiFi + BLE and collects all threats.
+    options.push_back({"Ambient Watch", ambient_watch});
     // Relocated from the BLE menu - the app's first known-good entry (Phase 0).
     options.push_back({"Tracker Detector", tracker_detector});
     options.push_back({"WiFi Camera", wifi_camera_detector});
