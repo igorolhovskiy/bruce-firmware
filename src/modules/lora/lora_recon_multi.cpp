@@ -7,6 +7,7 @@
 #include "core/mykeyboard.h"
 #include "lora_classify.h"
 #include "lora_nodes.h"
+#include "lora_profiles.h"
 #include <Arduino.h>
 #include <RadioLib.h>
 #include <algorithm>
@@ -26,20 +27,41 @@ namespace {
 
 using namespace loramp;
 
-// LongFast / EU_868 (same constants as Meshtastic.cpp).
-constexpr float MESH_FREQ_MHZ = 869.525f;
-constexpr float MESH_BW_KHZ = 250.0f;
-constexpr uint8_t MESH_SF = 11;
-constexpr uint8_t MESH_CR = 5;
-constexpr uint8_t MESH_SYNC_WORD = 0x2b;
-constexpr size_t MESH_PREAMBLE = 16;
-
 SPIClass *rmSpi = nullptr;
 Module *rmModule = nullptr;
 SX1262 *rmRadio = nullptr;
 volatile bool rmPacketReceived = false;
 
+// Profile cycling state.
+Region region = REGION_EU;
+const Profile *profTab = nullptr;
+size_t profCount = 0;
+size_t profIdx = 0;
+constexpr uint32_t DWELL_MS = 6000; // listen on each profile before hopping
+uint32_t lastHopMs = 0;
+
 void IRAM_ATTR onRmPacket() { rmPacketReceived = true; }
+
+// Apply one profile to the (already-begun) radio and resume RX. Returns true ok.
+bool applyProfile(const Profile &p) {
+    if (!rmRadio) return false;
+    int st = rmRadio->setFrequency(p.freqHz / 1e6);
+    if (st == RADIOLIB_ERR_NONE) st = rmRadio->setBandwidth(p.bwKhz10 / 10.0f);
+    if (st == RADIOLIB_ERR_NONE) st = rmRadio->setSpreadingFactor(p.sf);
+    if (st == RADIOLIB_ERR_NONE) st = rmRadio->setCodingRate(p.cr);
+    if (st == RADIOLIB_ERR_NONE) st = rmRadio->setPreambleLength(p.preamble);
+    if (st == RADIOLIB_ERR_NONE) st = rmRadio->setSyncWord(p.sync);
+    if (st == RADIOLIB_ERR_NONE) st = rmRadio->setCRC((p.flags & PFL_CRC) ? 1 : 0);
+    if (st == RADIOLIB_ERR_NONE) st = rmRadio->invertIQ((p.flags & PFL_INVERT) != 0);
+    if (st == RADIOLIB_ERR_NONE) st = rmRadio->startReceive();
+    if (st != RADIOLIB_ERR_NONE) {
+        Serial.printf("[LoRaMP] profile '%s' apply failed err=%d\n", p.name, st);
+        return false;
+    }
+    Serial.printf("[LoRaMP] profile -> %s  %.3fMHz SF%u BW%.1f sync=0x%02X\n", p.name, p.freqHz / 1e6,
+                  p.sf, p.bwKhz10 / 10.0f, p.sync);
+    return true;
+}
 
 void clearRadio() {
     if (rmRadio) {
@@ -64,23 +86,20 @@ bool radioUp() {
     rmModule = new Module(getLoraCsPin(), irqPin, getLoraResetPin(), busyPin, *rmSpi);
     rmRadio = new SX1262(rmModule);
 
-    int st = rmRadio->begin(MESH_FREQ_MHZ);
-    if (st == RADIOLIB_ERR_NONE) st = rmRadio->setBandwidth(MESH_BW_KHZ);
-    if (st == RADIOLIB_ERR_NONE) st = rmRadio->setSpreadingFactor(MESH_SF);
-    if (st == RADIOLIB_ERR_NONE) st = rmRadio->setCodingRate(MESH_CR);
-    if (st == RADIOLIB_ERR_NONE) st = rmRadio->setPreambleLength(MESH_PREAMBLE);
-    if (st == RADIOLIB_ERR_NONE) st = rmRadio->setSyncWord(MESH_SYNC_WORD);
-    if (st == RADIOLIB_ERR_NONE) st = rmRadio->setCRC(1);
-    if (st == RADIOLIB_ERR_NONE) st = rmRadio->invertIQ(false);
+    int st = rmRadio->begin(profTab[0].freqHz / 1e6);
     if (st == RADIOLIB_ERR_NONE) rmRadio->setDio1Action(onRmPacket);
-    if (st == RADIOLIB_ERR_NONE) st = rmRadio->startReceive();
     if (st != RADIOLIB_ERR_NONE) {
-        Serial.printf("[LoRaMP] radio init failed err=%d\n", st);
+        Serial.printf("[LoRaMP] radio begin failed err=%d\n", st);
         clearRadio();
         return false;
     }
-    Serial.printf("[LoRaMP] radio up: %.3fMHz SF%u BW%.0f sync=0x%02X (RX-only)\n", MESH_FREQ_MHZ,
-                  MESH_SF, MESH_BW_KHZ, MESH_SYNC_WORD);
+    profIdx = 0;
+    if (!applyProfile(profTab[0])) {
+        clearRadio();
+        return false;
+    }
+    Serial.printf("[LoRaMP] radio up (RX-only), region %s, %u profiles\n", regionName(region),
+                  (unsigned)profCount);
     return true;
 }
 
@@ -120,7 +139,8 @@ void drainPacket() {
         float snr = rmRadio->getSNR();
         rxCount++;
 
-        RadioCtx ctx = {MESH_FREQ_MHZ, MESH_SF, MESH_SYNC_WORD};
+        const Profile &cp = profTab[profIdx];
+        RadioCtx ctx = {cp.freqHz / 1e6f, cp.sf, cp.sync};
         Classified c;
         classify(buf, len, ctx, meshKey, meshKeyLen, rssi, snr, c);
         if (c.proto == LP_UNKNOWN) unknownCount++;
@@ -170,7 +190,8 @@ void drawRow(int slot, int y, const String &text, uint16_t fg) {
 void drawChrome() {
     tft.setTextSize(FP);
     char l0[64];
-    snprintf(l0, sizeof(l0), "LoRa Multi  LongFast 869.5");
+    snprintf(l0, sizeof(l0), "LoRa Multi %s  %s", regionName(region),
+             profTab ? profTab[profIdx].name : "");
     if (chromeCache[0] != l0) {
         chromeCache[0] = l0;
         tft.fillRect(0, 0, tftWidth, 11, TFT_BLACK);
@@ -223,9 +244,9 @@ void drawNodes(int rows) {
         flagStr(n.flags, fl, sizeof(fl));
         String label = n.name[0] ? String(n.name) : (String("!") + String(n.id, HEX));
         if (label.length() > 14) label = label.substring(0, 14);
-        char line[48];
-        snprintf(line, sizeof(line), "%c%s %d x%u %s", li == cursor ? '>' : ' ', label.c_str(),
-                 n.rssi, n.count, fl);
+        char line[52];
+        snprintf(line, sizeof(line), "%c%s %s %d x%u %s", li == cursor ? '>' : ' ',
+                 protoName((Proto)n.proto), label.c_str(), n.rssi, n.count, fl);
         uint16_t fg = li == cursor ? TFT_CYAN : (n.flags & (NF_HOPS_HIGH | NF_MQTT)) ? TFT_YELLOW : TFT_WHITE;
         drawRow(slot, y, line, fg);
     }
@@ -277,6 +298,11 @@ void loraReconMulti() {
     rmPacketReceived = false;
     meshtastic::expandPsk(1, meshKey, meshKeyLen); // LongFast default key
 
+    region = REGION_EU; // US915 table is available; region-toggle UI is a follow-up
+    profTab = profiles(region, profCount);
+    profIdx = 0;
+    lastHopMs = millis();
+
     if (!radioUp()) {
         tft.fillScreen(bruceConfig.bgColor);
         tft.setTextColor(TFT_RED, bruceConfig.bgColor);
@@ -289,6 +315,13 @@ void loraReconMulti() {
     while (true) {
         if (check(EscPress)) break;
         drainPacket();
+
+        // Hop to the next profile after the dwell window (retune + resume RX).
+        if (profCount > 1 && millis() - lastHopMs > DWELL_MS) {
+            lastHopMs = millis();
+            profIdx = (profIdx + 1) % profCount;
+            applyProfile(profTab[profIdx]);
+        }
 
         if (check(SelPress)) {
             tab = (tab == Tab::Nodes) ? Tab::Frames : Tab::Nodes;

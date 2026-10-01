@@ -21,6 +21,7 @@ enum NodeFlags : uint8_t {
     NF_MQTT = 0x02,      // relaying via MQTT (via_mqtt bit set)
     NF_OLD_FW = 0x04,    // hop_start == 0: pre-2.6 firmware heuristic
     NF_CHATTY = 0x08,    // seen more often than a quiet node (heuristic)
+    NF_BAD_CLOCK = 0x10, // MeshCore advert timestamp far from a sane floor
 };
 
 struct LoraNode {

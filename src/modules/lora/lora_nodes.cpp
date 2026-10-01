@@ -25,38 +25,55 @@ size_t NodeTable::evictOldest() {
 }
 
 size_t NodeTable::update(const Classified &c, uint32_t nowMs) {
-    if (c.proto != LP_MESHTASTIC) return SIZE_MAX; // only Meshtastic carries an id in Phase 1
-    uint32_t id = c.mt.from;
+    uint8_t proto;
+    uint32_t id;
+    const char *name;
+    uint8_t baseFlags = 0;
+    uint8_t hopLimit = 0, hopStart = 0;
+    if (c.proto == LP_MESHTASTIC) {
+        proto = LP_MESHTASTIC;
+        id = c.mt.from;
+        name = c.mtName;
+        baseFlags = flagsFromHeader(c.mt);
+        hopLimit = c.mt.hopLimit();
+        hopStart = c.mt.hopStart();
+    } else if (c.proto == LP_MESHCORE) {
+        proto = LP_MESHCORE;
+        id = c.mcId;
+        name = c.mcName;
+        if (c.mcBadClock) baseFlags |= NF_BAD_CLOCK;
+    } else {
+        return SIZE_MAX; // other protos carry no transmitter id yet
+    }
 
     for (size_t i = 0; i < nodes_.size(); i++) {
         LoraNode &n = nodes_[i];
-        if (n.proto == LP_MESHTASTIC && n.id == id) {
+        if (n.proto == proto && n.id == id) {
             n.rssi = c.rssi;
             if (c.rssi > n.bestRssi) n.bestRssi = c.rssi;
             n.snr = c.snr;
             if (n.count < 0xFFFF) n.count++;
             n.lastMs = nowMs;
-            n.hopLimit = c.mt.hopLimit();
-            n.hopStart = c.mt.hopStart();
-            n.flags |= flagsFromHeader(c.mt);
-            // "Chatty" heuristic: many frames in a short window.
+            n.hopLimit = hopLimit;
+            n.hopStart = hopStart;
+            n.flags |= baseFlags;
             if (n.count > 20 && (nowMs - n.firstMs) < 120000UL) n.flags |= NF_CHATTY;
-            if (c.mtName[0]) strlcpy(n.name, c.mtName, sizeof(n.name));
+            if (name[0]) strlcpy(n.name, name, sizeof(n.name));
             return i;
         }
     }
 
     if (nodes_.size() >= MAX_NODES) evictOldest();
     LoraNode n = {};
-    n.proto = LP_MESHTASTIC;
+    n.proto = proto;
     n.id = id;
-    if (c.mtName[0]) strlcpy(n.name, c.mtName, sizeof(n.name));
+    if (name[0]) strlcpy(n.name, name, sizeof(n.name));
     n.rssi = n.bestRssi = c.rssi;
     n.snr = c.snr;
     n.count = 1;
-    n.hopLimit = c.mt.hopLimit();
-    n.hopStart = c.mt.hopStart();
-    n.flags = flagsFromHeader(c.mt);
+    n.hopLimit = hopLimit;
+    n.hopStart = hopStart;
+    n.flags = baseFlags;
     n.firstMs = n.lastMs = nowMs;
     nodes_.push_back(n);
     return nodes_.size() - 1;

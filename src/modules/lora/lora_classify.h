@@ -24,10 +24,11 @@ namespace loramp {
 enum Proto : uint8_t {
     LP_UNKNOWN = 0, // received, but no decoder claimed it (still a sighting)
     LP_MESHTASTIC,
+    LP_MESHCORE,
     LP_LORAWAN,
 };
 
-const char *protoName(Proto p); // "MT", "LoRaWAN", "?"
+const char *protoName(Proto p); // "MT", "MC", "LoRaWAN", "?"
 
 // What radio config a frame was heard on - lets the classifier prefer the
 // network that lives there (Meshtastic sync 0x2B vs LoRaWAN sync 0x34).
@@ -46,7 +47,13 @@ struct Classified {
     bool mtDecrypted = false;    // LongFast key decoded a Data message
     uint32_t mtPortnum = 0;      // decoded portnum, if mtDecrypted
     char mtName[20] = {0};       // node long-name, if a NODEINFO frame
-    double lat = 0, lon = 0;     // if a POSITION frame
+    // MeshCore fields (valid when proto == LP_MESHCORE)
+    uint32_t mcId = 0;           // first 4 bytes of the advert public key
+    char mcName[24] = {0};       // advertised node name
+    uint8_t mcNodeType = 0;      // mcore::NodeType
+    bool mcBadClock = false;     // advert timestamp far from our clock
+    // Shared position (Meshtastic POSITION deferred; MeshCore advert lat/lon)
+    double lat = 0, lon = 0;
     bool hasPos = false;
     int8_t rssi = 0;
     float snr = 0;
