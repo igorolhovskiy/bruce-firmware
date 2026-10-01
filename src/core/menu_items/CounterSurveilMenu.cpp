@@ -11,6 +11,7 @@
 #include "modules/wifi/follower_scan.h"
 #include "modules/wifi/rogue_ap.h"
 #include "modules/wifi/wifi_camera_detector.h"
+#include "modules/wifi/wifi_pentest_detector.h"
 #include <globals.h>
 
 // About / Limits screen: states the passive nature and the hardware non-goals
@@ -58,6 +59,7 @@ void CounterSurveilMenu::optionsMenu() {
     options.push_back({"Rogue AP / Karma", rogue_ap});
     options.push_back({"BLE Spy Tags", ble_spy_detector});
     options.push_back({"Pentest Gear", pentest_detector});
+    options.push_back({"WiFi Pentest", wifi_pentest_detector});
     options.push_back({"Follower Scan", follower_scan});
     options.push_back({"Block-Ack DoS", blockack_detector});
     options.push_back({"About / Limits", counterSurveilAbout});
