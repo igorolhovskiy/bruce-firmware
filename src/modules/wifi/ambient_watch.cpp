@@ -5,6 +5,7 @@
 #include "core/sd_functions.h"
 #include "cs_classify.h"
 #include "modules/ble/ble_common.h"
+#include "modules/gps/cs_gps.h"
 #include "oui_db.h"
 #include <NimBLEDevice.h>
 #include <WiFi.h>
@@ -241,6 +242,8 @@ struct Threat {
     uint16_t minutes;
     uint32_t lastMinute;
     bool persistent;
+    bool follows;      // persistent AND moved >= 400 m with us (GPS, see cs_gps.h)
+    csgps::Track trk; // where we were when we heard it
 };
 // The threat table lives in PSRAM where the board has it. Once the BLE stack is
 // up, the T-Deck's *internal* heap is down to ~9 KB (NimBLE costs ~106 KB), and
@@ -304,28 +307,52 @@ char alertKind[12] = {0};
 char alertLabel[28] = {0};
 int8_t alertRssi = 0;
 uint32_t alertUntil = 0;
+bool alertPriority = false; // PERSIST / FOLLOWS banner: not overwritten by per-hit ones
 constexpr uint32_t ALERT_MS = 4000;
 constexpr uint32_t PERSIST_ALERT_MS = 15000; // rare and important: longer than a per-hit banner
 
 void raiseAlert(const Event &ev) {
     if (ev.hit.conf < alertFilter) return;
-    // A PERSIST banner outranks the per-hit one: let it run its full time.
-    if ((int32_t)(millis() - alertUntil) < 0 && !strcmp(alertKind, "PERSIST")) return;
+    // A PERSIST / FOLLOWS banner outranks the per-hit one: let it run its full time.
+    if ((int32_t)(millis() - alertUntil) < 0 && alertPriority) return;
+    alertPriority = false;
     strlcpy(alertKind, ev.hit.kind, sizeof(alertKind));
     strlcpy(alertLabel, ev.hit.label, sizeof(alertLabel));
     alertRssi = ev.rssi;
     alertUntil = millis() + ALERT_MS;
 }
 
+void priorityAlert(const Threat &t, const char *what) {
+    if (t.conf < alertFilter) return;
+    strlcpy(alertKind, what, sizeof(alertKind));
+    snprintf(alertLabel, sizeof(alertLabel), "%s %s", t.kind, t.label);
+    alertRssi = t.rssi;
+    alertUntil = millis() + PERSIST_ALERT_MS;
+    alertPriority = true;
+}
+
 void markPersistent(Threat &t) {
     t.persistent = true;
     Serial.printf("[Watch] PERSISTENT %s %s \"%s\" dwell %lus in %u distinct min, x%u rssi=%d\n", t.kind,
                   t.addr, t.label, (unsigned long)((t.lastMs - t.firstMs) / 1000), t.minutes, t.count, t.rssi);
-    if (t.conf < alertFilter) return;
-    strlcpy(alertKind, "PERSIST", sizeof(alertKind));
-    snprintf(alertLabel, sizeof(alertLabel), "%s %s", t.kind, t.label);
-    alertRssi = t.rssi;
-    alertUntil = millis() + PERSIST_ALERT_MS;
+    priorityAlert(t, "PERSIST");
+}
+
+void markFollows(Threat &t) {
+    t.follows = true;
+    Serial.printf("[Watch] FOLLOWS %s %s \"%s\" moved %um with us over %u places, dwell %lus\n", t.kind,
+                  t.addr, t.label, t.trk.maxDistM, t.trk.places, (unsigned long)((t.lastMs - t.firstMs) / 1000));
+    priorityAlert(t, "FOLLOWS");
+}
+
+// Feed the current GPS fix (if any) into a row's movement track, then promote
+// it: PERSIST on time alone, FOLLOWS once it is persistent AND moved with us.
+void updatePresence(Threat &t) {
+    csgps::Fix f;
+    if (csgps::fix(f)) csgps::trackUpdate(t.trk, f);
+    if (!t.persistent && t.lastMs - t.firstMs >= PERSIST_MS && t.minutes >= PERSIST_MINUTES)
+        markPersistent(t);
+    if (t.persistent && !t.follows && csgps::movedWithYou(t.trk)) markFollows(t);
 }
 
 // Refresh the evidence fields of a row from its latest event.
@@ -414,8 +441,7 @@ void onEvent(const Event &ev) {
                 t.lastMinute = minute;
                 if (t.minutes < 0xFFFF) t.minutes++;
             }
-            if (!t.persistent && t.lastMs - t.firstMs >= PERSIST_MS && t.minutes >= PERSIST_MINUTES)
-                markPersistent(t);
+            updatePresence(t);
             if (t.stale) {
                 t.stale = false;
                 Serial.printf("[Watch] LIVE again %s %s \"%s\" rssi=%d\n", t.kind, t.addr, t.label, ev.rssi);
@@ -445,6 +471,7 @@ void onEvent(const Event &ev) {
     t.firstMs = t.lastMs = millis();
     t.minutes = 1;
     t.lastMinute = t.lastMs / 60000;
+    updatePresence(t);
     threats[slot] = t;
     if (threatCount < THREAT_MAX) threatCount++;
     logThreat(ev); // new threats only
@@ -523,17 +550,19 @@ void drawRow(int slot, int y, const char *text, uint16_t fg, uint16_t bg = TFT_B
 // Live (not stale) rows; `high` / `pers` count only live HIGH / live persistent
 // rows (the latter within the filter), so a device that
 // merely passed by stops turning the status line red once it has gone grey.
-int activeCount(int *high, int *pers) {
+int activeCount(int *high, int *pers, int *fol) {
     uint32_t now = millis();
-    int c = 0, h = 0, p = 0;
+    int c = 0, h = 0, p = 0, fo = 0;
     for (size_t i = 0; i < threatCount; i++) {
         if (cs::isStale(threats[i].lastMs, now)) continue;
         c++;
         if (threats[i].conf == cs::CONF_HIGH) h++;
         if (threats[i].persistent && threats[i].conf >= alertFilter) p++;
+        if (threats[i].follows && threats[i].conf >= alertFilter) fo++;
     }
     if (high) *high = h;
     if (pers) *pers = p;
+    if (fol) *fol = fo;
     return c;
 }
 bool g_resting = false; // REST duty-cycle phase: both radios idle
@@ -541,29 +570,29 @@ bool g_resting = false; // REST duty-cycle phase: both radios idle
 void drawChrome(bool blePhase, uint8_t ch) {
     tft.setTextSize(FP);
     char l0[64];
-    if (g_resting) snprintf(l0, sizeof(l0), "Ambient Watch  [REST]");
-    else if (blePhase) snprintf(l0, sizeof(l0), "Ambient Watch  [BLE] scan");
-    else snprintf(l0, sizeof(l0), "Ambient Watch  [WIFI] ch%u", ch);
+    if (g_resting) snprintf(l0, sizeof(l0), "Ambient Watch  [REST]  %s", csgps::statusStr());
+    else if (blePhase) snprintf(l0, sizeof(l0), "Ambient Watch  [BLE] scan  %s", csgps::statusStr());
+    else snprintf(l0, sizeof(l0), "Ambient Watch  [WIFI] ch%u  %s", ch, csgps::statusStr());
     if (strcmp(chromeCache[0], l0) != 0) {
         strlcpy(chromeCache[0], l0, sizeof(chromeCache[0]));
         tft.fillRect(0, 0, tftWidth, 11, TFT_BLACK);
         tft.setTextColor(bruceConfig.priColor, TFT_BLACK);
         tft.drawString(l0, 4, 2);
     }
-    int hi = 0, pers = 0;
-    int live = activeCount(&hi, &pers);
+    int hi = 0, pers = 0, fol = 0;
+    int live = activeCount(&hi, &pers, &fol);
     bool alerting = (int32_t)(millis() - alertUntil) < 0 && alertKind[0];
     char l1[72];
     uint16_t l1fg;
     if (alerting) {
         snprintf(l1, sizeof(l1), "! %s %s %d", alertKind, alertLabel, alertRssi);
-        l1fg = strcmp(alertKind, "PERSIST") ? TFT_RED : TFT_MAGENTA;
+        l1fg = alertPriority ? TFT_MAGENTA : TFT_RED;
     } else {
-        int n = snprintf(l1, sizeof(l1), "live:%d/%u hi:%d P:%d filt:%s grey:%s", live,
-                         (unsigned)threatCount, hi, pers, filterName(alertFilter), cs::staleName());
+        int n = snprintf(l1, sizeof(l1), "live:%d/%u hi:%d P:%d F:%d filt:%s grey:%s", live,
+                         (unsigned)threatCount, hi, pers, fol, filterName(alertFilter), cs::staleName());
         if (ringDropped && n > 0 && (size_t)n < sizeof(l1))
             snprintf(l1 + n, sizeof(l1) - n, " drop:%lu", (unsigned long)ringDropped);
-        l1fg = pers > 0 ? TFT_MAGENTA : hi > 0 ? TFT_RED : (live == 0 ? TFT_GREEN : TFT_YELLOW);
+        l1fg = pers > 0 || fol > 0 ? TFT_MAGENTA : hi > 0 ? TFT_RED : (live == 0 ? TFT_GREEN : TFT_YELLOW);
     }
     if (strcmp(chromeCache[1], l1) != 0) {
         strlcpy(chromeCache[1], l1, sizeof(chromeCache[1]));
@@ -718,6 +747,16 @@ void buildDetails() {
         dAdd(TFT_DARKGREY, "Persist : %lu/%lum span, %u/%u distinct min", spanMin,
              (unsigned long)(PERSIST_MS / 60000), t.minutes, PERSIST_MINUTES);
     }
+    if (t.follows) {
+        dAdd(TFT_MAGENTA, "FOLLOWS : moved %u m with you, %u places", t.trk.maxDistM, t.trk.places);
+        dWrap(TFT_MAGENTA, "Heard at places >= 400 m apart over the persistence window: it travels "
+                           "with you.", 1);
+    } else if (t.trk.has) {
+        dAdd(TFT_DARKGREY, "Moved   : %u/%u m, %u/%u places (GPS)", t.trk.maxDistM, csgps::FOLLOW_DIST_M,
+             t.trk.places, csgps::FOLLOW_PLACES);
+    } else {
+        dAdd(TFT_DARKGREY, "Moved   : no GPS fix while heard (%s)", csgps::statusStr());
+    }
     if (cs::isStale(t.lastMs, now))
         dAdd(TFT_DARKGREY, " (stale: not heard for %s+ - passed by / gone)", cs::staleName());
 
@@ -767,7 +806,8 @@ void awDraw(bool blePhase, uint8_t ch) {
     std::sort(idx, idx + total, [&](int16_t a, int16_t b) {
         bool sa = cs::isStale(threats[a].lastMs, now), sb = cs::isStale(threats[b].lastMs, now);
         if (sa != sb) return sb; // live rows first, stale (greyed) ones sink
-        if (threats[a].persistent != threats[b].persistent) return threats[a].persistent; // then persistent
+        if (threats[a].follows != threats[b].follows) return threats[a].follows; // then follows,
+        if (threats[a].persistent != threats[b].persistent) return threats[a].persistent; // persistent
         if (threats[a].conf != threats[b].conf) return threats[a].conf > threats[b].conf;
         return threats[a].bestRssi > threats[b].bestRssi;
     });
@@ -791,7 +831,7 @@ void awDraw(bool blePhase, uint8_t ch) {
         bool stale = cs::isStale(t.lastMs, now);
         char line[ROW_CACHE_SZ];
         int n = snprintf(line, sizeof(line), "%c%c%c %s %.13s %d x%u", li == cursor ? '>' : ' ', cflag,
-                         t.persistent ? 'P' : ' ', t.kind, t.label, t.rssi, t.count);
+                         t.follows ? 'F' : t.persistent ? 'P' : ' ', t.kind, t.label, t.rssi, t.count);
         if (stale && n > 0 && (size_t)n < sizeof(line)) { // how long gone, e.g. " 3m05s"
             char ago[16];
             fmtAgo(now - t.lastMs, ago, sizeof(ago));
@@ -805,7 +845,7 @@ void awDraw(bool blePhase, uint8_t ch) {
         drawRow(slot, y, line, fg, li == cursor ? TFT_NAVY : TFT_BLACK);
     }
     listTotal = total;
-    drawFooter("SEL details  f filter  g grey-after  <-exit");
+    drawFooter("SEL details  f filter  g grey  p gps  <-exit");
 }
 
 void openDetails() {
@@ -892,6 +932,8 @@ char typedKey() {
 void ambient_watch() {
     Serial.println("[Watch] Ambient Watch starting (passive, time-sliced WiFi<->BLE)");
     cs::runCsClassifySelfTest();
+    csgps::begin("Watch");
+    csgps::selfTest();
 
     if (!allocThreats()) {
         Serial.println("[Watch] cannot allocate threat table - aborting");
@@ -933,6 +975,7 @@ void ambient_watch() {
         Event ev;
         int drained = 0;
         while (drained++ < 32 && ringPop(ev)) onEvent(ev);
+        csgps::poll();
 
         uint32_t now = millis();
         if (now - lastStaleCheck >= 1000) {
@@ -976,6 +1019,7 @@ void ambient_watch() {
         if (key == 'F') key = 'f';
         if (key == 'B') key = 'b';
         if (key == 'G') key = 'g';
+        if (key == 'P') key = 'p';
         if (detailOpen) {
             if (key == 'b') closeDetails();
             if (check(PrevPress)) detailScroll--;
@@ -984,6 +1028,7 @@ void ambient_watch() {
         } else {
             if (key == 'f') cycleFilter();
             if (key == 'g') cycleStaleKey();
+            if (key == 'p') csgps::cycleMode();
             if (check(SelPress)) openDetails();
             if (check(PrevPress) && cursor > 0) cursor--;
             if (check(NextPress)) cursor++;
@@ -996,6 +1041,7 @@ void ambient_watch() {
     if (blePhase) stopBlePhase();
     else if (!g_resting) stopWifiPhase(false); // during REST both radios are already idle
     freeThreats();
+    csgps::end();
     WiFi.mode(prevMode);
     Serial.printf("[Watch] stopped. threats=%u wifiFrames=%lu dropped=%lu\n",
                   (unsigned)threatCount, (unsigned long)wifiFrames, (unsigned long)ringDropped);

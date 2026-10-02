@@ -103,11 +103,14 @@ const ToolHelp DET_TOOLS[] = {
      "not heard for that long is greyed and sinks - it passed by. It re-lights if "
      "heard again. Shared with the other Detector lists.\n\nP / magenta = PERSISTENT: heard "
      "over 10+ min in 6+ distinct minutes. Moving? It is following you. Staying put? "
-     "Probably fixed nearby."},
+     "Probably fixed nearby.\n\nF = FOLLOWS (needs GPS): persistent AND heard at 3+ "
+     "places spanning 400+ m - it travels with you. p: GPS on/off (shared by Tracker + "
+     "Follower)."},
     {"Tracker Detector",
      "Finds BLE item trackers that may be following you: Apple Find My/AirTag, "
      "Samsung SmartTag, Tile.\n\nHint: AirTags rotate their address, so a moving "
-     "tracker is the real signal."},
+     "tracker is the real signal.\n\nF / magenta (needs GPS): 5+ min AND heard at 3+ "
+     "places spanning 400+ m. p: GPS on/off."},
     {"WiFi Camera",
      "Flags WiFi devices whose MAC vendor (OUI) or SSID matches a camera / ALPR / "
      "Flock / Ring vendor. H/M/L confidence.\n\nTune the SSID include/exclude lists "
@@ -134,7 +137,8 @@ const ToolHelp DET_TOOLS[] = {
      "deauther (pwned SSID), and Pwnagotchi (pwnd_tot beacon field, shows its name)."},
     {"Follower Scan",
      "Dwell-time model over WiFi-probe + BLE addresses. Mark 'I moved' to surface "
-     "an address that keeps appearing wherever you go (a possible tail)."},
+     "an address that keeps appearing wherever you go (a possible tail).\n\nWith a GPS "
+     "fix the mark is set automatically every 300 m. p: GPS on/off."},
     {"Block-Ack DoS",
      "Passive counterpart to the BAR DoS attack: watches 802.11 Block-Ack-Request "
      "rate per transmitter and flags a flood (>=12 BAR/s)."},

@@ -5,6 +5,7 @@
 #include "modules/wifi/cs_classify.h"
 #include "core/sd_functions.h"
 #include "modules/ble/ble_common.h"
+#include "modules/gps/cs_gps.h"
 #include <globals.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -138,6 +139,8 @@ struct TrackerEnt {
     uint32_t lastMs;
     uint8_t payloadLen;   // last raw advertisement (for the detail "why" view)
     uint8_t payload[31];
+    csgps::Track trk; // where we were when we heard it (GPS)
+    bool follows;     // persistent AND moved >= 400 m with us
 };
 constexpr size_t TRACKER_MAX = 128;
 std::vector<TrackerEnt> trackers;
@@ -195,6 +198,19 @@ void logSighting(const Sighting &s) {
 }
 
 // ── Model update (main loop) ────────────────────────────────────────────────
+// GPS: feed the current fix into the tracker's movement track; "follows" needs
+// the time rule (PERSIST_MS dwell) AND real movement (csgps::movedWithYou).
+void updateMovement(TrackerEnt &e) {
+    csgps::Fix f;
+    if (csgps::fix(f)) csgps::trackUpdate(e.trk, f);
+    if (!e.follows && e.lastMs - e.firstMs >= PERSIST_MS && csgps::movedWithYou(e.trk)) {
+        e.follows = true;
+        Serial.printf("[Tracker] FOLLOWS %s %s moved %um with us over %u places, dwell %lus\n",
+                      typeName(e.type), e.addr, e.trk.maxDistM, e.trk.places,
+                      (unsigned long)((e.lastMs - e.firstMs) / 1000));
+    }
+}
+
 void onSighting(const Sighting &s) {
     for (auto &e : trackers) {
         if (strcmp(e.addr, s.addr) == 0) {
@@ -205,6 +221,7 @@ void onSighting(const Sighting &s) {
             if (s.separated) e.separated = 1;
             e.payloadLen = s.payloadLen;
             memcpy(e.payload, s.payload, s.payloadLen);
+            updateMovement(e);
             logSighting(s);
             return;
         }
@@ -224,6 +241,7 @@ void onSighting(const Sighting &s) {
     e.firstMs = e.lastMs = s.atMs;
     e.payloadLen = s.payloadLen;
     memcpy(e.payload, s.payload, s.payloadLen);
+    updateMovement(e);
     trackers.push_back(e);
     logSighting(s);
 }
@@ -273,6 +291,12 @@ int persistentCount() {
         if (e.lastMs - e.firstMs >= PERSIST_MS) c++;
     return c;
 }
+int followsCount() {
+    int c = 0;
+    for (auto &e : trackers)
+        if (e.follows) c++;
+    return c;
+}
 
 void drawChrome() {
     tft.setTextSize(FP);
@@ -287,18 +311,20 @@ void drawChrome() {
         tft.drawString(l0, 4, 2);
     }
     char l1[64];
-    snprintf(l1, sizeof(l1), "sort:%s  following:%d", sortName(sortMode), pers);
+    int fol = followsCount();
+    snprintf(l1, sizeof(l1), "sort:%s  persist:%d  moved:%d  %s", sortName(sortMode), pers, fol,
+             csgps::statusStr());
     if (chromeCache[1] != l1) {
         chromeCache[1] = l1;
         tft.fillRect(0, 13, tftWidth, 12, TFT_BLACK);
-        tft.setTextColor(pers > 0 ? TFT_RED : TFT_GREEN, TFT_BLACK);
+        tft.setTextColor(fol > 0 ? TFT_MAGENTA : pers > 0 ? TFT_RED : TFT_GREEN, TFT_BLACK);
         tft.drawString(l1, 4, 14);
         tft.drawFastHLine(0, CHROME_H - 2, tftWidth, TFT_DARKGREY);
     }
 }
 
 void drawFooter() {
-    String hint = detailView ? "<-/SEL back  ^v scroll" : "SEL details  ^v select  s sort  <-exit";
+    String hint = detailView ? "<-/SEL back  ^v scroll" : "SEL details  ^v select  s sort  p gps  <-exit";
     if (footerCache == hint) return;
     footerCache = hint;
     tft.fillRect(0, tftHeight - FOOTER_H, tftWidth, FOOTER_H, TFT_BLACK);
@@ -371,10 +397,11 @@ void drawBody() {
         // cursor, type (+! if Apple separated), MAC tail, dwell time, count, last-seen ago, rssi
         String tail = String(e.addr).substring(9); // last 3 octets "cc:dd:ee"... keep short
         String line = String(li == cursor ? '>' : ' ') + String(typeName(e.type)) +
-                      (e.separated ? "!" : " ") + " " + tail + "  " + fmtSpan(dur) + " x" +
+                      (e.separated ? "!" : " ") + (e.follows ? "F" : " ") + tail + "  " + fmtSpan(dur) + " x" +
                       String(e.count) + " " + fmtSpan(now - e.lastMs) + " " + String(e.rssi);
         uint16_t fg = li == cursor        ? TFT_CYAN
                       : cs::isStale(e.lastMs, now) ? TFT_DARKGREY
+                      : e.follows           ? TFT_MAGENTA
                       : (dur >= PERSIST_MS) ? TFT_RED
                       : (e.separated)       ? TFT_YELLOW
                                             : TFT_WHITE;
@@ -413,8 +440,13 @@ void drawDetail() {
     lines[n] = String("RSSI: ") + e.rssi + " (best " + e.bestRssi + ")"; fgs[n++] = TFT_WHITE;
     lines[n] = String("Seen x") + e.count + "  dwell " + fmtSpan(e.lastMs - e.firstMs); fgs[n++] = TFT_WHITE;
     lines[n] = String("Last seen ") + fmtSpan(now - e.lastMs) + " ago"; fgs[n++] = TFT_WHITE;
-    lines[n] = String("Following: ") + (persistent ? "YES (>5 min dwell)" : "not yet");
-    fgs[n++] = persistent ? TFT_RED : TFT_GREEN;
+    lines[n] = String("Following: ") + (e.follows ? "YES - moved with you" : persistent ? "YES (>5 min dwell)" : "not yet");
+    fgs[n++] = e.follows ? TFT_MAGENTA : persistent ? TFT_RED : TFT_GREEN;
+    if (e.trk.has)
+        lines[n] = String("Moved: ") + e.trk.maxDistM + "/" + csgps::FOLLOW_DIST_M + " m, " + e.trk.places +
+                   "/" + csgps::FOLLOW_PLACES + " places";
+    else lines[n] = String("Moved: no GPS fix while heard (") + csgps::statusStr() + ")";
+    fgs[n++] = e.follows ? TFT_MAGENTA : TFT_DARKGREY;
     lines[n] = ""; fgs[n++] = TFT_WHITE;
     lines[n] = "Why flagged:"; fgs[n++] = bruceConfig.priColor;
     lines[n] = String("- ") + typeSignature(e.type); fgs[n++] = TFT_WHITE;
@@ -481,6 +513,7 @@ void tracker_detector() {
     pBLEScan->setActiveScan(false);
     pBLEScan->setMaxResults(0); // callback-only, don't buffer
     pBLEScan->start(0, false);  // scan until stopped
+    csgps::begin("Tracker");
 
     trackerDraw();
 
@@ -488,6 +521,7 @@ void tracker_detector() {
         Sighting s;
         int drained = 0;
         while (drained++ < 32 && ringPop(s)) onSighting(s);
+        csgps::poll();
 
         // ESC: in the detail page, go back to the list; in the list, exit.
         if (check(EscPress)) {
@@ -508,6 +542,7 @@ void tracker_detector() {
             if (!detailView) cursor++;
         }
         char c = checkLetterShortcutPress();
+        if (c == 'p' || c == 'P') csgps::cycleMode();
         if (c == 's' || c == 'S') {
             sortMode = (SortMode)((sortMode + 1) % 3);
             cursor = 0;
@@ -520,6 +555,7 @@ void tracker_detector() {
 
     pBLEScan->stop();
     stopBLEStack();
+    csgps::end();
     Serial.printf(
         "[Tracker] stopped. trackers=%u dropped=%lu\n", (unsigned)trackers.size(),
         (unsigned long)ringDropped

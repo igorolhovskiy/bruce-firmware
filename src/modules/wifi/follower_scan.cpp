@@ -4,6 +4,7 @@
 #include "core/mykeyboard.h"
 #include "core/sd_functions.h"
 #include "modules/ble/ble_common.h"
+#include "modules/gps/cs_gps.h"
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <globals.h>
@@ -175,6 +176,23 @@ void onSeen(const SeenEvent &ev) {
     seen.push_back(e);
 }
 
+// GPS auto-move: with a fix, the "I moved" mark is set automatically once we are
+// AUTO_MOVE_M from the last mark. 300 m is past typical 2.4 GHz phone / BLE
+// range, so a fixed AP heard on both sides of a short walk does not "cross".
+constexpr float AUTO_MOVE_M = 300.0f;
+bool moveAnchorSet = false;
+float moveAnchLat = 0, moveAnchLon = 0;
+int autoMoves = 0;
+
+void setMoveAnchor() {
+    csgps::Fix f;
+    moveAnchorSet = csgps::fix(f);
+    if (moveAnchorSet) {
+        moveAnchLat = f.lat;
+        moveAnchLon = f.lon;
+    }
+}
+
 // Mark "I moved": snapshot which addresses were present, so a re-sighting flags
 // a follower. Only currently-known entries can be "before" the move.
 void markMove() {
@@ -186,6 +204,21 @@ void markMove() {
         e.afterMove = false;
     }
     Serial.printf("[Follower] move #%d marked; %u addrs snapshotted\n", moveCount, (unsigned)seen.size());
+    setMoveAnchor();
+}
+
+void autoMoveTick() {
+    csgps::Fix f;
+    if (!csgps::fix(f)) return;
+    if (!moveAnchorSet) { // first fix: this is where we started
+        setMoveAnchor();
+        return;
+    }
+    float d = csgps::distM(moveAnchLat, moveAnchLon, f.lat, f.lon);
+    if (d < AUTO_MOVE_M) return;
+    autoMoves++;
+    Serial.printf("[Follower] GPS: moved %.0f m since last mark -> auto move\n", d);
+    markMove();
 }
 
 int crossedCount() {
@@ -247,9 +280,8 @@ void drawChrome() {
     }
     int cr = crossedCount();
     char l1[72];
-    snprintf(
-        l1, sizeof(l1), "seen:%u  moves:%d  followers:%d", (unsigned)seen.size(), moveCount, cr
-    );
+    snprintf(l1, sizeof(l1), "seen:%u moves:%d followers:%d %s", (unsigned)seen.size(), moveCount, cr,
+             csgps::statusStr());
     if (chromeCache[1] != l1) {
         chromeCache[1] = l1;
         tft.fillRect(0, 13, tftWidth, 12, TFT_BLACK);
@@ -260,7 +292,7 @@ void drawChrome() {
 }
 void drawFooter() {
     String hint = detailView ? "<-/SEL back  ^v scroll"
-                             : "SEL details  ^v select  i moved  m mode  <-exit";
+                             : "SEL details ^v sel i moved m mode p gps <-exit";
     if (footerCache == hint) return;
     footerCache = hint;
     tft.fillRect(0, tftHeight - FOOTER_H, tftWidth, FOOTER_H, TFT_BLACK);
@@ -425,6 +457,8 @@ void follower_scan() {
     detailView = false;
     moveMarked = false;
     moveCount = 0;
+    moveAnchorSet = false;
+    autoMoves = 0;
     fullClear = true;
     mode = MODE_WIFI;
 
@@ -445,12 +479,15 @@ void follower_scan() {
     }
 
     startWifi();
+    csgps::begin("Follower");
     followDraw();
 
     while (true) {
         SeenEvent ev;
         int drained = 0;
         while (drained++ < 64 && ringPop(ev)) onSeen(ev);
+        csgps::poll();
+        autoMoveTick();
 
         if (mode == MODE_WIFI && millis() - lastHopMs > HOP_MS) {
             lastHopMs = millis();
@@ -476,7 +513,8 @@ void follower_scan() {
             if (!detailView) cursor++;
         }
         char c = checkLetterShortcutPress();
-        if (c == 'i' || c == 'I') markMove(); // "I moved" mark (was SEL)
+        if (c == 'i' || c == 'I') markMove(); // "I moved" mark (was SEL); GPS also sets it
+        if (c == 'p' || c == 'P') csgps::cycleMode();
         if (c == 'm' || c == 'M') {
             if (mode == MODE_WIFI) {
                 stopWifi();
@@ -496,6 +534,7 @@ void follower_scan() {
 
     if (mode == MODE_WIFI) stopWifi();
     else stopBle();
+    csgps::end();
     Serial.printf(
         "[Follower] stopped. seen=%u moves=%d followers=%d dropped=%lu\n", (unsigned)seen.size(),
         moveCount, crossedCount(), (unsigned long)ringDropped
