@@ -16,6 +16,7 @@
 #include "modules/wifi/responder.h"
 #include "modules/wifi/scan_hosts.h"
 #include "modules/wifi/sniffer.h"
+#include "core/tool_help.h"
 #include "modules/wifi/channel_analyzer.h"
 #include "modules/wifi/wifi_analyzer.h"
 #include "modules/wifi/wifi_atks.h"
@@ -62,6 +63,7 @@ void WifiMenu::optionsMenu() {
     }
     options.push_back({"WiFi Analyzer", wifi_analyzer});
     options.push_back({"Channel Analyzer", channel_analyzer_setup});
+    options.push_back({"Tool Help", wifiToolHelp});
     options.push_back({"Wifi Atks", wifi_atk_menu});
     options.push_back({"Evil Portal", [=]() {
                            // WebUI cleanup now handled automatically inside EvilPortal constructor

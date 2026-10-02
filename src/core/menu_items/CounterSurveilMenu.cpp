@@ -2,6 +2,7 @@
 
 #include "core/display.h"
 #include "core/mykeyboard.h"
+#include "core/tool_help.h"
 #include "core/utils.h"
 #include "modules/ble/ble_spy_detector.h"
 #include "modules/ble/pentest_detector.h"
@@ -71,6 +72,7 @@ void CounterSurveilMenu::optionsMenu() {
     options.push_back({"WiFi Pentest", wifi_pentest_detector});
     options.push_back({"Follower Scan", follower_scan});
     options.push_back({"Block-Ack DoS", blockack_detector});
+    options.push_back({"Tool Help", detectorToolHelp});
     options.push_back({"About / Limits", counterSurveilAbout});
 
     addOptionToMainMenu();

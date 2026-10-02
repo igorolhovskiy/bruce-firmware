@@ -1,4 +1,5 @@
 #include "BleMenu.h"
+#include "core/tool_help.h"
 #include "core/display.h"
 #include "core/utils.h"
 #include "modules/badusb_ble/ducky_typer.h"
@@ -46,6 +47,9 @@ void BleMenu::optionsMenu() {
     options.push_back({"BLE Suite", [=]() { BleSuiteMenu(); }});
     options.push_back({"Ninebot", [=]() { BLENinebot(); }});
     options.push_back({"LED Badge", [=]() { ledBadgeMenu(); }});
+#endif
+#if !defined(LITE_VERSION)
+    options.push_back({"Tool Help", bleToolHelp});
 #endif
     addOptionToMainMenu();
 
