@@ -3,7 +3,6 @@
 #include "core/display.h"
 #include "core/mykeyboard.h"
 #include "core/sd_functions.h"
-#include "core/serialcmds.h"
 #include "cs_classify.h"
 #include "modules/ble/ble_common.h"
 #include "oui_db.h"
@@ -878,58 +877,6 @@ void stopBlePhase() {
     stopBLEStack();
 }
 
-// ── Headless test hooks (serial lines) ───────────────────────────────────────
-// Bruce's serialcmds task is suspended while the watch runs (see ambient_watch()),
-// otherwise it consumes these lines first and rejects them as unknown commands.
-// "sim on" / "sim off": feed a synthetic HIGH tracker (DE:AD:BE:EF:00:01) every
-// 20 s straight into onEvent() (main loop only, so no race with the radio-side
-// ring producers). "dump": print the table. "g": cycle grey-after. Lets the
-// STALE / PERSISTENT transitions be verified with no real device around.
-bool simOn = false;
-uint32_t simLast = 0;
-void simTick() {
-    if (!simOn || millis() - simLast < 20000) return;
-    simLast = millis();
-    Event e = {};
-    strlcpy(e.addr, "DE:AD:BE:EF:00:01", sizeof(e.addr));
-    strlcpy(e.name, "SIM", sizeof(e.name));
-    e.rssi = -60;
-    e.ble = true;
-    e.frame = FR_BLE_ADV;
-    e.addrType = 1;
-    e.company = 0xFFFF;
-    e.hit.hit = true;
-    strlcpy(e.hit.kind, "TRACKER", sizeof(e.hit.kind));
-    strlcpy(e.hit.label, "SIM test tracker", sizeof(e.hit.label));
-    e.hit.conf = cs::CONF_HIGH;
-    onEvent(e);
-}
-void dumpTable() {
-    uint32_t now = millis();
-    Serial.printf("[Watch] table: %u rows, grey-after %s\n", (unsigned)threatCount, cs::staleName());
-    for (size_t i = 0; i < threatCount; i++) {
-        const Threat &t = threats[i];
-        Serial.printf("[Watch]  %s%s %s %s \"%s\" span %lus min %u x%u silent %lus\n",
-                      t.persistent ? "P" : "-", cs::isStale(t.lastMs, now) ? "S" : "L", t.kind, t.addr,
-                      t.label, (unsigned long)((t.lastMs - t.firstMs) / 1000), t.minutes, t.count,
-                      (unsigned long)((now - t.lastMs) / 1000));
-    }
-}
-void serialCmd() {
-    if (!Serial.available()) return;
-    String line = Serial.readStringUntil('\n');
-    line.trim();
-    if (line == "sim on") {
-        simOn = true;
-        simLast = 0;
-        Serial.println("[Watch] sim ON (synthetic tracker every 20 s)");
-    } else if (line == "sim off") {
-        simOn = false;
-        Serial.println("[Watch] sim OFF");
-    } else if (line == "dump") dumpTable();
-    else if (line == "g") cycleStaleKey();
-}
-
 // Last typed character on keyboard boards, 0 if none. (Backspace needs no
 // handling here: the board's input handler already turns it into EscPress.)
 char typedKey() {
@@ -961,13 +908,10 @@ void ambient_watch() {
     alertFilter = cs::CONF_MED;
     alertUntil = 0;
     alertKind[0] = 0;
-    simOn = false;
     g_resting = false;
     fullClear = true;
 
     wifi_mode_t prevMode = WiFi.getMode();
-    // Own the serial port for the test hooks (serialCmd); resumed on exit.
-    if (serialcmdsTaskHandle) vTaskSuspend(serialcmdsTaskHandle);
 
     constexpr uint32_t WIFI_PHASE_MS = 8000;
     constexpr uint32_t BLE_PHASE_MS = 6000;
@@ -989,8 +933,6 @@ void ambient_watch() {
         Event ev;
         int drained = 0;
         while (drained++ < 32 && ringPop(ev)) onEvent(ev);
-        serialCmd();
-        simTick();
 
         uint32_t now = millis();
         if (now - lastStaleCheck >= 1000) {
@@ -1054,7 +996,6 @@ void ambient_watch() {
     if (blePhase) stopBlePhase();
     else if (!g_resting) stopWifiPhase(false); // during REST both radios are already idle
     freeThreats();
-    if (serialcmdsTaskHandle) vTaskResume(serialcmdsTaskHandle);
     WiFi.mode(prevMode);
     Serial.printf("[Watch] stopped. threats=%u wifiFrames=%lu dropped=%lu\n",
                   (unsigned)threatCount, (unsigned long)wifiFrames, (unsigned long)ringDropped);
