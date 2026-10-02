@@ -2,6 +2,7 @@
 
 #include "core/display.h"
 #include "core/mykeyboard.h"
+#include "core/sd_functions.h"
 #include "cs_classify.h"
 #include "modules/ble/ble_common.h"
 #include "oui_db.h"
@@ -313,6 +314,50 @@ void absorbEvidence(Threat &t, const Event &ev) {
     }
 }
 
+// ── SD logging (new threats only, to avoid flooding) ─────────────────────────
+bool watchSd = false;
+const char *WATCH_DIR = "/BruceDetector";
+const char *WATCH_CSV = "/BruceDetector/watch.csv";
+String watchClk() {
+    if (clock_set) {
+        struct tm t = rtc.getTimeStruct();
+        char b[9];
+        snprintf(b, sizeof(b), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+        return String(b);
+    }
+    uint32_t s = millis() / 1000;
+    char b[16];
+    snprintf(b, sizeof(b), "+%02u:%02u:%02u", (unsigned)(s / 3600), (unsigned)((s / 60) % 60),
+             (unsigned)(s % 60));
+    return String(b);
+}
+void watchSetupSd() {
+    watchSd = false;
+    if (sdcardMounted || setupSdCard()) {
+        if (!SD.exists(WATCH_DIR)) SD.mkdir(WATCH_DIR);
+        watchSd = true;
+        if (!SD.exists(WATCH_CSV)) {
+            File f = SD.open(WATCH_CSV, FILE_APPEND);
+            if (f) {
+                f.println("uptime_ms,clock,band,addr,kind,label,rssi,confidence");
+                f.close();
+            }
+        }
+        Serial.printf("[Watch] logging -> %s\n", WATCH_CSV);
+    } else {
+        Serial.println("[Watch] no SD card - logging disabled");
+    }
+}
+void logThreat(const Event &ev) {
+    if (!watchSd) return;
+    File f = SD.open(WATCH_CSV, FILE_APPEND);
+    if (!f) return;
+    f.println(String(millis()) + "," + watchClk() + "," + (ev.ble ? "BLE" : "WIFI") + "," + ev.addr +
+              "," + ev.hit.kind + ",\"" + String(ev.hit.label) + "\"," + String(ev.rssi) + "," +
+              cs::confName(ev.hit.conf));
+    f.close();
+}
+
 void onEvent(const Event &ev) {
     raiseAlert(ev);
     if (!threats) return;
@@ -358,6 +403,7 @@ void onEvent(const Event &ev) {
     t.firstMs = t.lastMs = millis();
     threats[slot] = t;
     if (threatCount < THREAT_MAX) threatCount++;
+    logThreat(ev); // new threats only
     Serial.printf("[Watch] %s HIT %s %s \"%s\" rssi=%d conf=%s\n", ev.ble ? "BLE" : "WIFI", ev.hit.kind,
                   ev.addr, ev.hit.label, ev.rssi, cs::confName(ev.hit.conf));
 }
@@ -416,10 +462,13 @@ int highCount() {
         if (threats[i].conf == cs::CONF_HIGH) c++;
     return c;
 }
+bool g_resting = false; // REST duty-cycle phase: both radios idle
+
 void drawChrome(bool blePhase, uint8_t ch) {
     tft.setTextSize(FP);
     char l0[64];
-    if (blePhase) snprintf(l0, sizeof(l0), "Ambient Watch  [BLE] scan");
+    if (g_resting) snprintf(l0, sizeof(l0), "Ambient Watch  [REST]");
+    else if (blePhase) snprintf(l0, sizeof(l0), "Ambient Watch  [BLE] scan");
     else snprintf(l0, sizeof(l0), "Ambient Watch  [WIFI] ch%u", ch);
     if (strcmp(chromeCache[0], l0) != 0) {
         strlcpy(chromeCache[0], l0, sizeof(chromeCache[0]));
@@ -753,15 +802,18 @@ void ambient_watch() {
     cursor = scroll = 0;
     listTotal = 0;
     detailOpen = false;
+    watchSetupSd();
     alertFilter = cs::CONF_MED;
     alertUntil = 0;
     alertKind[0] = 0;
+    g_resting = false;
     fullClear = true;
 
     wifi_mode_t prevMode = WiFi.getMode();
 
     constexpr uint32_t WIFI_PHASE_MS = 8000;
     constexpr uint32_t BLE_PHASE_MS = 6000;
+    constexpr uint32_t REST_PHASE_MS = 3000; // radios idle: cuts power/heat on long watches
     constexpr uint32_t HOP_MS = 350;
 
     bool blePhase = false;
@@ -782,30 +834,34 @@ void ambient_watch() {
 
         uint32_t now = millis();
         // WiFi channel hop within the WiFi phase.
-        if (!blePhase && now - lastHop > HOP_MS) {
+        if (!blePhase && !g_resting && now - lastHop > HOP_MS) {
             lastHop = now;
             chIdx = (chIdx + 1) % N_WIFI_CH;
             esp_wifi_set_channel(wifi_channels[chIdx], WIFI_SECOND_CHAN_NONE);
         }
-        // Phase switch.
-        uint32_t phaseLen = blePhase ? BLE_PHASE_MS : WIFI_PHASE_MS;
+        // Phase cycle: WIFI -> BLE -> REST -> WIFI. REST idles both radios to cut
+        // power/heat on long watches. No fullClear on a switch: per-row diffing
+        // repaints only the changed [BLE]/[WIFI]/[REST] header, so the threat list
+        // and any active alert stay on screen.
+        uint32_t phaseLen = g_resting ? REST_PHASE_MS : (blePhase ? BLE_PHASE_MS : WIFI_PHASE_MS);
         if (now - phaseStart > phaseLen) {
-            if (blePhase) {
-                stopBlePhase();
+            if (g_resting) { // REST done -> WiFi
+                g_resting = false;
+                blePhase = false;
                 chIdx = 0;
                 startWifiPhase(chIdx);
+            } else if (blePhase) { // BLE done -> REST (BLE stack torn down, radios idle)
+                stopBlePhase();
                 blePhase = false;
-            } else {
+                g_resting = true;
+            } else { // WiFi done -> BLE
                 stopWifiPhase(true);
                 startBlePhase();
                 blePhase = true;
             }
             phaseStart = millis();
             lastHop = millis();
-            // No fullClear here: the threat list + any active alert must stay on
-            // screen across a phase switch. Per-row diffing repaints only the one
-            // changed header line (the [BLE]/[WIFI] indicator), no flash.
-            Serial.printf("[Watch] phase -> %s\n", blePhase ? "BLE" : "WIFI");
+            Serial.printf("[Watch] phase -> %s\n", g_resting ? "REST" : (blePhase ? "BLE" : "WIFI"));
         }
 
         // Input never blocks: events keep draining and phases keep switching
@@ -830,7 +886,7 @@ void ambient_watch() {
     }
 
     if (blePhase) stopBlePhase();
-    else stopWifiPhase(false);
+    else if (!g_resting) stopWifiPhase(false); // during REST both radios are already idle
     freeThreats();
     WiFi.mode(prevMode);
     Serial.printf("[Watch] stopped. threats=%u wifiFrames=%lu dropped=%lu\n",

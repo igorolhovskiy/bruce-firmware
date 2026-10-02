@@ -85,9 +85,15 @@ Hit classifyWifi(const uint8_t *mac, const char *ssid) {
 }
 
 Hit classifyWifiBeacon(const uint8_t *frame, int len) {
-    // Pwnagotchi beacons carry a JSON "pwnd_tot" field in their IEs.
     if (!frame || len <= 36) return Hit{};
     if (len > 512) len = 512;
+    // Open Drone ID (ASTM F3411): the vendor signature FA-0B-BC-0D in a beacon
+    // vendor-IE. Exact 4-byte match -> HIGH. (Full operator-location decode lives
+    // in the dedicated Drone Remote ID detector; the watch only flags presence.)
+    for (int i = 36; i + 4 <= len; i++)
+        if (frame[i] == 0xFA && frame[i + 1] == 0x0B && frame[i + 2] == 0xBC && frame[i + 3] == 0x0D)
+            return mk("DRONE", "OpenDroneID", CONF_HIGH, WHY_BEACON_DRONE);
+    // Pwnagotchi beacons carry a JSON "pwnd_tot" field in their IEs.
     static const char KEY[] = "pwnd_tot";
     const int kl = sizeof(KEY) - 1;
     for (int i = 36; i + kl <= len; i++)
@@ -102,6 +108,7 @@ Hit classifyBle(const uint8_t *mac, uint8_t addrType, const char *name, uint16_t
         uint16_t u = svcUuids[i];
         if (u == 0x3081 || u == 0x3082 || u == 0x3083)
             return mk("FLIPPER", "Flipper", CONF_HIGH, WHY_BLE_SVC, u);
+        if (u == 0xFFFA) return mk("DRONE", "OpenDroneID", CONF_HIGH, WHY_BLE_SVC, u);
         if (u == 0xFD5A) return mk("TRACKER", "SmartTag", CONF_HIGH, WHY_BLE_SVC, u);
         if (u == 0xFEED || u == 0xFEEC) return mk("TRACKER", "Tile", CONF_MED, WHY_BLE_SVC, u);
         if (u == 0xFEAA) return mk("TRACKER", "FindMy", CONF_MED, WHY_BLE_SVC, u);
@@ -158,6 +165,7 @@ static const char *svcName(uint16_t u) {
     case 0xFEEC: return "Tile tracker";
     case 0xFEAA: return "Google Eddystone/Find My Device beacon";
     case 0xFD5F: return "Meta / Ray-Ban Meta glasses";
+    case 0xFFFA: return "ASTM Open Drone ID (Remote ID)";
     default: return "known signature";
     }
 }
@@ -201,6 +209,10 @@ void explainWhy(uint8_t why, uint16_t a, char *out, size_t n) {
     case WHY_BEACON_PWND:
         snprintf(out, n, "Beacon carries the \"pwnd_tot\" JSON field that only Pwnagotchi broadcasts "
                          "(it advertises its handshake count to its peers).");
+        break;
+    case WHY_BEACON_DRONE:
+        snprintf(out, n, "Frame carries the ASTM Open Drone ID signature (FA-0B-BC-0D) - a drone "
+                         "broadcasting Remote ID. Open the Drone Remote ID detector for full decode.");
         break;
     case WHY_BLE_SVC:
         snprintf(out, n, "BLE advert lists service UUID 0x%04X = %s.", a, svcName(a));
@@ -247,10 +259,18 @@ bool runCsClassifySelfTest() {
     uint16_t svc[1] = {0x3082};
     Hit b = classifyBle(rnd, 1, "Flipper Zero", 0xFFFF, svc, 1);
     bool t4 = b.hit && strcmp(b.kind, "FLIPPER") == 0 && b.conf == CONF_HIGH;
+    // WiFi beacon: Open Drone ID vendor signature FA-0B-BC-0D in the body.
+    uint8_t dframe[48] = {0};
+    dframe[40] = 0xFA;
+    dframe[41] = 0x0B;
+    dframe[42] = 0xBC;
+    dframe[43] = 0x0D;
+    Hit d = classifyWifiBeacon(dframe, sizeof(dframe));
+    bool t5 = d.hit && strcmp(d.kind, "DRONE") == 0 && d.conf == CONF_HIGH;
 
-    ok = t1 && t2 && t3 && t4;
-    Serial.printf("[Watch] self-test %s (cam=%d pineapple=%d campus-excl=%d flipper=%d)\n",
-                  ok ? "PASS" : "FAIL", t1, t2, t3, t4);
+    ok = t1 && t2 && t3 && t4 && t5;
+    Serial.printf("[Watch] self-test %s (cam=%d pineapple=%d campus-excl=%d flipper=%d drone=%d)\n",
+                  ok ? "PASS" : "FAIL", t1, t2, t3, t4, t5);
     return ok;
 }
 

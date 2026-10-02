@@ -76,6 +76,17 @@ Features developed in this fork, on top of stock Bruce. Each is T-Deck Plus only
   802.11 BlockAckReq control frames, tracks per-transmitter BAR rate / broadcast-RA use / sequence-number
   jumps, and flags a flood at ≥12 BAR/s); and the relocated Tracker Detector below. An **About / Limits**
   entry states the hardware non-goals on-device.
+  Recent additions: the shared OUI DB now also flags **Flock Safety / ALPR (Motorola, Genetec) /
+  Ring** cameras and more camera vendors, so WiFi Camera surfaces them by vendor; **Pentest Gear**
+  (passive BLE detection of Flipper Zero via exact service-UUID/company-ID/OUI) and **WiFi Pentest**
+  (Hak5 Pineapple SSID, ESP deauther `pwned`, Pwnagotchi `pwnd_tot` beacons) detectors; **Meta /
+  Ray-Ban / Snap camera glasses** flagged by BLE Spy Tags; and **Ambient Watch** — a single always-on
+  mode that time-slices WiFi + BLE through all the above classifiers into one de-duplicated,
+  confidence-graded threat list with a transient alert banner, a cycleable confidence filter
+  (`f` key: All / Med+ / High), a per-device "why it's listed" details view, and CSV logging to
+  `/BruceDetector/watch.csv`. (OUI / signature data for the camera/pentest/glasses additions is
+  adapted from [skizzophrenic/SquachWatch-CYD](https://github.com/skizzophrenic/SquachWatch-CYD),
+  GPL-3.0.)
 - **[Tracker Detector](./docs/ble-tracker-detector-README.md)** — passive, receive-only scan
   (**now under Detector → Tracker Detector**, moved out of the BLE menu) that classifies
   advertisements as Apple Find My/AirTag, Tile, or Samsung SmartTag; builds a live per-device table

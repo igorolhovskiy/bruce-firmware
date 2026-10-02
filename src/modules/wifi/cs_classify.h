@@ -29,6 +29,7 @@ enum Why : uint8_t {
     WHY_SSID_CAM,       // arg = index into bruceConfig.camSsidPatterns
     WHY_SSID_CAM_IOT,   // as above, plus the MAC is a known IoT vendor
     WHY_BEACON_PWND,    // beacon carries Pwnagotchi's "pwnd_tot" field
+    WHY_BEACON_DRONE,   // frame carries the ASTM Open Drone ID vendor signature
     WHY_BLE_SVC,        // arg = 16-bit service UUID
     WHY_BLE_COMPANY,    // arg = manufacturer company ID
     WHY_BLE_OUI,        // arg = OuiClass of a public BLE address
