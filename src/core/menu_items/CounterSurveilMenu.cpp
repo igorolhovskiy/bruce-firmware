@@ -11,6 +11,7 @@
 #include "modules/wifi/drone_remoteid.h"
 #include "modules/wifi/follower_scan.h"
 #include "modules/wifi/rogue_ap.h"
+#include "modules/wifi/stream_cam_detector.h"
 #include "modules/wifi/wifi_camera_detector.h"
 #include "modules/wifi/wifi_pentest_detector.h"
 #include <globals.h>
@@ -62,6 +63,7 @@ void CounterSurveilMenu::optionsMenu() {
     // Relocated from the BLE menu - the app's first known-good entry (Phase 0).
     options.push_back({"Tracker Detector", tracker_detector});
     options.push_back({"WiFi Camera", wifi_camera_detector});
+    options.push_back({"Stream Cam", stream_cam_detector});
     options.push_back({"Drone Remote ID", drone_remoteid});
     options.push_back({"Rogue AP / Karma", rogue_ap});
     options.push_back({"BLE Spy Tags", ble_spy_detector});
