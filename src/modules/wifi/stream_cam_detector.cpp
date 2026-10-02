@@ -18,8 +18,10 @@
 
 namespace {
 
-enum Conf : uint8_t { SC_NONE = 0, SC_LOW = 1, SC_MED = 2 };
-const char *confName(uint8_t c) { return c == SC_MED ? "MED" : c == SC_LOW ? "LOW" : "-"; }
+enum Conf : uint8_t { SC_NONE = 0, SC_LOW = 1, SC_MED = 2, SC_HIGH = 3 };
+const char *confName(uint8_t c) {
+    return c == SC_HIGH ? "HIGH" : c == SC_MED ? "MED" : c == SC_LOW ? "LOW" : "-";
+}
 
 // "Large" data frame (video MPDUs run near the MTU; control/ACKs are tiny).
 constexpr uint16_t LARGE_BYTES = 1000;
@@ -34,6 +36,7 @@ struct Station {
     volatile uint32_t upstreamFrames;
     uint32_t firstMs;
     volatile uint32_t lastMs;
+    volatile bool confirmed; // Phase 2: a motion-correlated rate spike was seen
 };
 constexpr size_t MAX_ST = 64;
 Station stations[MAX_ST];
@@ -87,6 +90,7 @@ void IRAM_ATTR sc_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     stations[n].upstreamFrames = upstream ? 1 : 0;
     stations[n].firstMs = curMs;
     stations[n].lastMs = curMs;
+    stations[n].confirmed = false;
     stationCount = n + 1;
 }
 
@@ -130,6 +134,7 @@ void buildCandidates(std::vector<Cand> &out) {
                  uf = stations[i].upstreamFrames;
         uint32_t span = stations[i].lastMs - stations[i].firstMs;
         uint8_t c = scoreStation(df, lf, uf, span);
+        if (stations[i].confirmed) c = SC_HIGH; // motion-confirmed: always listed, top
         if (c == SC_NONE) continue;
         uint32_t rate = span ? df * 1000UL / span : 0;
         uint32_t lpct = df ? lf * 100UL / df : 0;
@@ -162,7 +167,7 @@ void drawChrome(int candCount) {
     }
 }
 void drawFooter() {
-    String hint = "^v select  <-exit  (heuristic)";
+    String hint = "SEL motion-test  ^v sel  <-exit";
     if (footerCache == hint) return;
     footerCache = hint;
     tft.fillRect(0, tftHeight - FOOTER_H, tftWidth, FOOTER_H, TFT_BLACK);
@@ -201,14 +206,133 @@ void scDraw() {
         }
         const Cand &c = cands[li];
         const Station &s = stations[c.idx];
+        char cflag = c.conf == SC_HIGH ? 'H' : c.conf == SC_MED ? 'M' : 'L';
         char line[56];
         snprintf(line, sizeof(line), "%c%c %02X%02X:%02X%02X ch%u %lu/s %lu%%L",
-                 li == cursor ? '>' : ' ', c.conf == SC_MED ? 'M' : 'L', s.mac[2], s.mac[3], s.mac[4],
-                 s.mac[5], s.ch, (unsigned long)c.rate, (unsigned long)c.largePct);
-        uint16_t fg = li == cursor ? TFT_CYAN : c.conf == SC_MED ? TFT_RED : TFT_YELLOW;
+                 li == cursor ? '>' : ' ', cflag, s.mac[2], s.mac[3], s.mac[4], s.mac[5], s.ch,
+                 (unsigned long)c.rate, (unsigned long)c.largePct);
+        uint16_t fg = li == cursor         ? TFT_CYAN
+                      : c.conf == SC_HIGH  ? TFT_RED
+                      : c.conf == SC_MED   ? TFT_YELLOW
+                                           : TFT_DARKGREY;
         drawRow(slot, y, line, fg);
     }
     drawFooter();
+}
+
+// ── Phase 2: motion-correlation confirmation ─────────────────────────────────
+// Lock to a candidate's channel, measure its live packet rate, learn a baseline
+// while the user holds still, then flag a correlated spike when they cause motion
+// (VBR video traffic rises with scene change) -> raises the station to HIGH.
+bool confirmMode = false;
+int confirmIdx = -1;
+constexpr uint32_t CF_SAMPLE_MS = 250;
+constexpr uint32_t CF_BASELINE_MS = 3000; // hold-still window to learn the baseline
+constexpr int CF_HIST = 40;
+uint32_t cfHist[CF_HIST];
+int cfHistCount = 0;
+uint32_t cfStartMs, cfLastSampleMs, cfLastFrames;
+uint32_t cfBaselineSum, cfBaselineN, cfBaseline;
+bool cfBaselineSet;
+uint32_t cfRate, cfMaxRate;
+bool cfSpike;
+
+void enterConfirm(int stationIdx) {
+    confirmMode = true;
+    confirmIdx = stationIdx;
+    cfHistCount = 0;
+    cfStartMs = cfLastSampleMs = curMs;
+    cfLastFrames = stations[stationIdx].dataFrames;
+    cfBaselineSum = cfBaselineN = cfBaseline = 0;
+    cfBaselineSet = false;
+    cfRate = cfMaxRate = 0;
+    cfSpike = false;
+    fullClear = true;
+    // Lock the radio to this station's channel (stop hopping) for the duration.
+    curChannel = stations[stationIdx].ch;
+    esp_wifi_set_channel(curChannel, WIFI_SECOND_CHAN_NONE);
+    Serial.printf("[StreamCam] confirm: locking ch%u on station %02X%02X%02X%02X%02X%02X\n", curChannel,
+                  stations[stationIdx].mac[0], stations[stationIdx].mac[1], stations[stationIdx].mac[2],
+                  stations[stationIdx].mac[3], stations[stationIdx].mac[4], stations[stationIdx].mac[5]);
+}
+
+void sampleConfirm() {
+    if (curMs - cfLastSampleMs < CF_SAMPLE_MS) return;
+    uint32_t dt = curMs - cfLastSampleMs;
+    uint32_t frames = stations[confirmIdx].dataFrames;
+    uint32_t rate = (frames - cfLastFrames) * 1000UL / (dt ? dt : 1);
+    cfLastFrames = frames;
+    cfLastSampleMs = curMs;
+    cfRate = rate;
+    if (rate > cfMaxRate) cfMaxRate = rate;
+    cfHist[cfHistCount % CF_HIST] = rate;
+    cfHistCount++;
+
+    if (!cfBaselineSet) {
+        cfBaselineSum += rate;
+        cfBaselineN++;
+        if (curMs - cfStartMs >= CF_BASELINE_MS) {
+            cfBaseline = cfBaselineN ? cfBaselineSum / cfBaselineN : 0;
+            cfBaselineSet = true;
+            Serial.printf("[StreamCam] confirm: baseline=%lu/s, cause motion now\n",
+                          (unsigned long)cfBaseline);
+        }
+    } else if (!cfSpike) {
+        // Spike = clearly above the quiet baseline (relative AND absolute margin).
+        if (rate > cfBaseline * 18 / 10 + 10) {
+            cfSpike = true;
+            stations[confirmIdx].confirmed = true;
+            Serial.printf("[StreamCam] confirm: MOTION SPIKE rate=%lu base=%lu -> HIGH\n",
+                          (unsigned long)rate, (unsigned long)cfBaseline);
+        }
+    }
+}
+
+void scDrawConfirm() {
+    if (fullClear) {
+        tft.fillScreen(TFT_BLACK);
+        resetCache();
+        fullClear = false;
+    }
+    const Station &s = stations[confirmIdx];
+    char l0[48];
+    snprintf(l0, sizeof(l0), "Motion test  %02X%02X:%02X%02X ch%u", s.mac[2], s.mac[3], s.mac[4],
+             s.mac[5], s.ch);
+    drawRow(0, 2, l0, bruceConfig.priColor);
+
+    const char *phase = !cfBaselineSet ? "Hold STILL (baseline)..." : "CAUSE MOTION at the camera";
+    drawRow(1, 14, phase, cfBaselineSet ? TFT_YELLOW : TFT_DARKGREY);
+
+    char l2[40];
+    snprintf(l2, sizeof(l2), "rate %lu/s  base %lu  max %lu", (unsigned long)cfRate,
+             (unsigned long)cfBaseline, (unsigned long)cfMaxRate);
+    drawRow(2, 28, l2, TFT_WHITE);
+
+    // Sparkline of recent rates (own region, cleared each sample -> small, no flash).
+    int gx = 6, gy = 44, gw = tftWidth - 12, gh = 60;
+    tft.fillRect(gx, gy, gw, gh, TFT_BLACK);
+    tft.drawFastHLine(gx, gy + gh, gw, TFT_DARKGREY);
+    int n = cfHistCount < CF_HIST ? cfHistCount : CF_HIST;
+    uint32_t scaleMax = cfMaxRate < 10 ? 10 : cfMaxRate;
+    for (int i = 0; i < n; i++) {
+        int idx = (cfHistCount - n + i) % CF_HIST;
+        if (idx < 0) idx += CF_HIST;
+        int bh = (int)(cfHist[idx] * gh / scaleMax);
+        if (bh > gh) bh = gh;
+        int bx = gx + i * (gw / (CF_HIST));
+        tft.fillRect(bx, gy + gh - bh, (gw / CF_HIST) - 1 > 0 ? (gw / CF_HIST) - 1 : 1, bh,
+                     cfSpike ? TFT_RED : bruceConfig.priColor);
+    }
+    // Baseline marker line.
+    if (cfBaselineSet) {
+        int by = gy + gh - (int)(cfBaseline * gh / scaleMax);
+        if (by < gy) by = gy;
+        tft.drawFastHLine(gx, by, gw, TFT_DARKGREY);
+    }
+
+    drawRow(12, tftHeight - 26, cfSpike ? "MOTION SPIKE -> LIKELY CAMERA" : "",
+            cfSpike ? TFT_RED : TFT_BLACK);
+    drawRow(13, tftHeight - 13, "<- back", TFT_DARKGREY);
 }
 
 // ── Offline self-test ──────────────────────────────────────────────────────────
@@ -251,15 +375,40 @@ void stream_cam_detector() {
     esp_wifi_set_channel(curChannel, WIFI_SECOND_CHAN_NONE);
     uint32_t dwellStart = millis();
     curMs = millis();
+    confirmMode = false;
     scDraw();
 
-    while (!check(EscPress)) {
+    for (;;) {
         curMs = millis();
-        if (curMs - dwellStart > DWELL_MS) {
+
+        if (confirmMode) {
+            if (check(EscPress)) { // back to the list; resume hopping
+                confirmMode = false;
+                dwellStart = curMs;
+                fullClear = true;
+                continue;
+            }
+            check(SelPress);
+            check(PrevPress);
+            check(NextPress); // swallow (no nav in confirm)
+            sampleConfirm();
+            scDrawConfirm();
+            delay(30);
+            continue;
+        }
+
+        // List mode
+        if (check(EscPress)) break;
+        if (curMs - dwellStart > DWELL_MS) { // slow channel hop
             chIdx = (chIdx + 1) % NCH;
             curChannel = channels[chIdx];
             esp_wifi_set_channel(curChannel, WIFI_SECOND_CHAN_NONE);
             dwellStart = curMs;
+        }
+        if (check(SelPress)) { // SEL -> motion-test the selected candidate
+            std::vector<Cand> cands;
+            buildCandidates(cands);
+            if (cursor >= 0 && cursor < (int)cands.size()) enterConfirm(cands[cursor].idx);
         }
         if (check(PrevPress) && cursor > 0) cursor--;
         if (check(NextPress)) cursor++;
