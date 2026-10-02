@@ -2,6 +2,7 @@
 
 #include "core/display.h"
 #include "core/mykeyboard.h"
+#include "modules/wifi/cs_classify.h"
 #include "core/sd_functions.h"
 #include "oui_db.h"
 #include <WiFi.h>
@@ -452,6 +453,7 @@ void drawBody() {
         String line = String(li == cursor ? '>' : ' ') + String(cflag) + " " + ven + " " + name +
                       " c" + String(c.ch) + " " + String(c.rssi) + " x" + String(c.count) + " " + macTail;
         uint16_t fg = li == cursor ? TFT_CYAN
+                      : cs::isStale(c.lastMs, millis()) ? TFT_DARKGREY
                       : c.conf == CONF_HIGH ? TFT_RED
                       : c.conf == CONF_MED  ? TFT_YELLOW
                                             : TFT_DARKGREY;

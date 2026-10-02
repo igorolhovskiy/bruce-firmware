@@ -10,6 +10,25 @@ namespace cs {
 
 const char *confName(uint8_t c) { return c == CONF_HIGH ? "HIGH" : c == CONF_MED ? "MED" : "LOW"; }
 
+// Stale threshold steps (index 1 = default 2 min). Why 2 min:
+//  - Ambient Watch cycles WIFI 8 s / BLE 6 s / REST 3 s = 17 s, so a tracker
+//    still nearby is heard every cycle: an AirTag in separated mode advertises
+//    every ~2 s, AP beacons every ~100 ms. 2 min is ~7 missed cycles.
+//  - Idle phones probe in bursts 30 s - a few minutes apart (Android ~72 s,
+//    iOS ~330 s; Freudiger 2015), so 1 min would flicker a probe-only device
+//    that is still there.
+//  - Walking (~1.4 m/s) a BLE/WiFi device is in range ~1 min; in a car, seconds.
+//    2 min greys a passer-by shortly after it is gone.
+//  - Stalker-tracker detectors look at a much longer window (AirGuard: 3+
+//    sightings, distinct places, >=10 min / 30 min), so 2 min never hides a
+//    device that is actually following you - it just recolours when heard again.
+static const uint32_t STALE_STEPS[] = {60000UL, 120000UL, 300000UL, 600000UL, 0};
+static const char *const STALE_NAMES[] = {"1m", "2m", "5m", "10m", "off"};
+static uint8_t staleIdx = 1;
+uint32_t staleMs() { return STALE_STEPS[staleIdx]; }
+const char *staleName() { return STALE_NAMES[staleIdx]; }
+void cycleStale() { staleIdx = (staleIdx + 1) % (sizeof(STALE_STEPS) / sizeof(STALE_STEPS[0])); }
+
 static bool ciContains(const char *hay, const char *needle) {
     if (!hay || !needle || !*needle) return false;
     for (const char *h = hay; *h; h++) {

@@ -3,6 +3,7 @@
 #include "core/display.h"
 #include "core/mykeyboard.h"
 #include "core/sd_functions.h"
+#include "core/serialcmds.h"
 #include "cs_classify.h"
 #include "modules/ble/ble_common.h"
 #include "oui_db.h"
@@ -235,6 +236,12 @@ struct Threat {
     uint16_t chMask; // bit n = heard on WiFi channel n
     uint16_t company;
     uint16_t svc[MAX_SVC];
+    bool stale; // last state reported on serial by reportStale()
+    // Persistence: distinct wall-clock minutes the row was heard in, and the
+    // sticky "has been with us a while" flag (see PERSIST_MS below).
+    uint16_t minutes;
+    uint32_t lastMinute;
+    bool persistent;
 };
 // The threat table lives in PSRAM where the board has it. Once the BLE stack is
 // up, the T-Deck's *internal* heap is down to ~9 KB (NimBLE costs ~106 KB), and
@@ -282,19 +289,44 @@ bool allocThreats() {
 uint8_t alertFilter = cs::CONF_MED;
 const char *filterName(uint8_t f) { return f == cs::CONF_HIGH ? "High" : f == cs::CONF_MED ? "Med+" : "All"; }
 
+// PERSISTENT marker: a row heard over at least PERSIST_MS (first -> last) AND in
+// at least PERSIST_MINUTES distinct minutes. The 10 min span follows AirGuard's
+// stalking-detection threshold duration (Heinrich et al. 2022); the distinct-
+// minutes rule stops two isolated sightings 10 min apart (a neighbour's device
+// blinking in and out) from counting as "with you all along". With no location
+// fix this cannot tell "following me" from "fixed here": if you are moving it
+// is the former, if you are sitting still it is a device installed nearby.
+// Sticky once set: it survives going stale and coming back.
+constexpr uint32_t PERSIST_MS = 10UL * 60 * 1000;
+constexpr uint16_t PERSIST_MINUTES = 6;
+
 // Transient alert banner (set on a qualifying hit, auto-clears).
 char alertKind[12] = {0};
 char alertLabel[28] = {0};
 int8_t alertRssi = 0;
 uint32_t alertUntil = 0;
 constexpr uint32_t ALERT_MS = 4000;
+constexpr uint32_t PERSIST_ALERT_MS = 15000; // rare and important: longer than a per-hit banner
 
 void raiseAlert(const Event &ev) {
     if (ev.hit.conf < alertFilter) return;
+    // A PERSIST banner outranks the per-hit one: let it run its full time.
+    if ((int32_t)(millis() - alertUntil) < 0 && !strcmp(alertKind, "PERSIST")) return;
     strlcpy(alertKind, ev.hit.kind, sizeof(alertKind));
     strlcpy(alertLabel, ev.hit.label, sizeof(alertLabel));
     alertRssi = ev.rssi;
     alertUntil = millis() + ALERT_MS;
+}
+
+void markPersistent(Threat &t) {
+    t.persistent = true;
+    Serial.printf("[Watch] PERSISTENT %s %s \"%s\" dwell %lus in %u distinct min, x%u rssi=%d\n", t.kind,
+                  t.addr, t.label, (unsigned long)((t.lastMs - t.firstMs) / 1000), t.minutes, t.count, t.rssi);
+    if (t.conf < alertFilter) return;
+    strlcpy(alertKind, "PERSIST", sizeof(alertKind));
+    snprintf(alertLabel, sizeof(alertLabel), "%s %s", t.kind, t.label);
+    alertRssi = t.rssi;
+    alertUntil = millis() + PERSIST_ALERT_MS;
 }
 
 // Refresh the evidence fields of a row from its latest event.
@@ -378,6 +410,17 @@ void onEvent(const Event &ev) {
             }
             absorbEvidence(t, ev);
             t.lastMs = millis();
+            uint32_t minute = t.lastMs / 60000;
+            if (minute != t.lastMinute) {
+                t.lastMinute = minute;
+                if (t.minutes < 0xFFFF) t.minutes++;
+            }
+            if (!t.persistent && t.lastMs - t.firstMs >= PERSIST_MS && t.minutes >= PERSIST_MINUTES)
+                markPersistent(t);
+            if (t.stale) {
+                t.stale = false;
+                Serial.printf("[Watch] LIVE again %s %s \"%s\" rssi=%d\n", t.kind, t.addr, t.label, ev.rssi);
+            }
             return;
         }
     }
@@ -401,11 +444,28 @@ void onEvent(const Event &ev) {
     t.company = 0xFFFF;
     absorbEvidence(t, ev);
     t.firstMs = t.lastMs = millis();
+    t.minutes = 1;
+    t.lastMinute = t.lastMs / 60000;
     threats[slot] = t;
     if (threatCount < THREAT_MAX) threatCount++;
     logThreat(ev); // new threats only
     Serial.printf("[Watch] %s HIT %s %s \"%s\" rssi=%d conf=%s\n", ev.ble ? "BLE" : "WIFI", ev.hit.kind,
                   ev.addr, ev.hit.label, ev.rssi, cs::confName(ev.hit.conf));
+}
+
+// Serial mirror of live -> stale (greyed) transitions; the reverse is printed
+// in onEvent(). Cheap enough to call every loop pass, but done once a second.
+void reportStale() {
+    uint32_t now = millis();
+    for (size_t i = 0; i < threatCount; i++) {
+        Threat &t = threats[i];
+        bool st = cs::isStale(t.lastMs, now);
+        if (st && !t.stale)
+            Serial.printf("[Watch] STALE %s %s \"%s\" (silent %lus, dwell %lus, x%u)\n", t.kind, t.addr,
+                          t.label, (unsigned long)((now - t.lastMs) / 1000),
+                          (unsigned long)((t.lastMs - t.firstMs) / 1000), t.count);
+        t.stale = st;
+    }
 }
 
 // ── Rendering (per-row diffed) ───────────────────────────────────────────────
@@ -418,6 +478,7 @@ constexpr int CHROME_H = 26, FOOTER_H = 12, ROW_H = 11, MAX_ROWS = 18;
 constexpr size_t ROW_CACHE_SZ = 56;
 char rowCache[MAX_ROWS][ROW_CACHE_SZ];
 uint16_t rowFgCache[MAX_ROWS];
+uint16_t rowBgCache[MAX_ROWS];
 char chromeCache[2][80];
 const char *footerDrawn = nullptr; // hint currently on screen
 bool fullClear = true;
@@ -439,6 +500,7 @@ void resetCache() {
         rowCache[i][0] = '\x01'; // sentinel: matches no real row text
         rowCache[i][1] = 0;
         rowFgCache[i] = 0xDEAD;
+        rowBgCache[i] = TFT_BLACK;
     }
     for (int i = 0; i < 2; i++) {
         chromeCache[i][0] = '\x01';
@@ -446,20 +508,33 @@ void resetCache() {
     }
     footerDrawn = nullptr;
 }
-void drawRow(int slot, int y, const char *text, uint16_t fg) {
+// `bg` other than black marks the cursor row, so the row keeps its state colour
+// (red / magenta persistent / grey stale) while selected.
+void drawRow(int slot, int y, const char *text, uint16_t fg, uint16_t bg = TFT_BLACK) {
     if (slot < 0 || slot >= MAX_ROWS) return;
-    if (strcmp(rowCache[slot], text) == 0 && rowFgCache[slot] == fg) return;
+    if (strcmp(rowCache[slot], text) == 0 && rowFgCache[slot] == fg && rowBgCache[slot] == bg) return;
     strlcpy(rowCache[slot], text, ROW_CACHE_SZ);
     rowFgCache[slot] = fg;
-    tft.fillRect(0, y - 1, tftWidth, ROW_H, TFT_BLACK);
+    rowBgCache[slot] = bg;
+    tft.fillRect(0, y - 1, tftWidth, ROW_H, bg);
     tft.setTextSize(FP);
-    tft.setTextColor(fg, TFT_BLACK);
+    tft.setTextColor(fg, bg);
     tft.drawString(text, 4, y);
 }
-int highCount() {
-    int c = 0;
-    for (size_t i = 0; i < threatCount; i++)
-        if (threats[i].conf == cs::CONF_HIGH) c++;
+// Live (not stale) rows; `high` / `pers` count only live HIGH / live persistent
+// rows (the latter within the filter), so a device that
+// merely passed by stops turning the status line red once it has gone grey.
+int activeCount(int *high, int *pers) {
+    uint32_t now = millis();
+    int c = 0, h = 0, p = 0;
+    for (size_t i = 0; i < threatCount; i++) {
+        if (cs::isStale(threats[i].lastMs, now)) continue;
+        c++;
+        if (threats[i].conf == cs::CONF_HIGH) h++;
+        if (threats[i].persistent && threats[i].conf >= alertFilter) p++;
+    }
+    if (high) *high = h;
+    if (pers) *pers = p;
     return c;
 }
 bool g_resting = false; // REST duty-cycle phase: both radios idle
@@ -476,17 +551,20 @@ void drawChrome(bool blePhase, uint8_t ch) {
         tft.setTextColor(bruceConfig.priColor, TFT_BLACK);
         tft.drawString(l0, 4, 2);
     }
-    int hi = highCount();
+    int hi = 0, pers = 0;
+    int live = activeCount(&hi, &pers);
     bool alerting = (int32_t)(millis() - alertUntil) < 0 && alertKind[0];
     char l1[72];
     uint16_t l1fg;
     if (alerting) {
         snprintf(l1, sizeof(l1), "! %s %s %d", alertKind, alertLabel, alertRssi);
-        l1fg = TFT_RED;
+        l1fg = strcmp(alertKind, "PERSIST") ? TFT_RED : TFT_MAGENTA;
     } else {
-        snprintf(l1, sizeof(l1), "threats:%u high:%d filt:%s drop:%lu", (unsigned)threatCount, hi,
-                 filterName(alertFilter), (unsigned long)ringDropped);
-        l1fg = hi > 0 ? TFT_RED : (threatCount == 0 ? TFT_GREEN : TFT_YELLOW);
+        int n = snprintf(l1, sizeof(l1), "live:%d/%u hi:%d P:%d filt:%s grey:%s", live,
+                         (unsigned)threatCount, hi, pers, filterName(alertFilter), cs::staleName());
+        if (ringDropped && n > 0 && (size_t)n < sizeof(l1))
+            snprintf(l1 + n, sizeof(l1) - n, " drop:%lu", (unsigned long)ringDropped);
+        l1fg = pers > 0 ? TFT_MAGENTA : hi > 0 ? TFT_RED : (live == 0 ? TFT_GREEN : TFT_YELLOW);
     }
     if (strcmp(chromeCache[1], l1) != 0) {
         strlcpy(chromeCache[1], l1, sizeof(chromeCache[1]));
@@ -632,8 +710,17 @@ void buildDetails() {
     fmtAgo(now - t.firstMs, first, sizeof(first));
     fmtAgo(now - t.lastMs, last, sizeof(last));
     dAdd(TFT_WHITE, "Seen    : %ux, first %s ago, last %s ago", t.count, first, last);
-    if (now - t.lastMs > 60000)
-        dAdd(TFT_DARKGREY, " (not heard for a while - out of range or off)");
+    unsigned long spanMin = (t.lastMs - t.firstMs) / 60000;
+    if (t.persistent) {
+        dAdd(TFT_MAGENTA, "PERSISTENT: heard over %lum, in %u distinct min", spanMin, t.minutes);
+        dWrap(TFT_MAGENTA, "If you have been moving, it moved with you. If you stayed put, it may be "
+                           "fixed nearby.", 1);
+    } else {
+        dAdd(TFT_DARKGREY, "Persist : %lu/%lum span, %u/%u distinct min", spanMin,
+             (unsigned long)(PERSIST_MS / 60000), t.minutes, PERSIST_MINUTES);
+    }
+    if (cs::isStale(t.lastMs, now))
+        dAdd(TFT_DARKGREY, " (stale: not heard for %s+ - passed by / gone)", cs::staleName());
 
     dAdd(TFT_DARKGREY, "--- Why it is on the list ---");
     cs::explainWhy(t.why, t.whyArg, buf, sizeof(buf));
@@ -677,7 +764,11 @@ void awDraw(bool blePhase, uint8_t ch) {
     int total = 0;
     for (size_t i = 0; i < threatCount; i++)
         if (threats[i].conf >= alertFilter) idx[total++] = (int16_t)i; // ALERT FILTER gates the list
+    uint32_t now = millis();
     std::sort(idx, idx + total, [&](int16_t a, int16_t b) {
+        bool sa = cs::isStale(threats[a].lastMs, now), sb = cs::isStale(threats[b].lastMs, now);
+        if (sa != sb) return sb; // live rows first, stale (greyed) ones sink
+        if (threats[a].persistent != threats[b].persistent) return threats[a].persistent; // then persistent
         if (threats[a].conf != threats[b].conf) return threats[a].conf > threats[b].conf;
         return threats[a].bestRssi > threats[b].bestRssi;
     });
@@ -698,17 +789,24 @@ void awDraw(bool blePhase, uint8_t ch) {
         }
         const Threat &t = threats[idx[li]];
         char cflag = t.conf == cs::CONF_HIGH ? 'H' : t.conf == cs::CONF_MED ? 'M' : 'L';
+        bool stale = cs::isStale(t.lastMs, now);
         char line[ROW_CACHE_SZ];
-        snprintf(line, sizeof(line), "%c%c %s %.14s %d x%u", li == cursor ? '>' : ' ', cflag,
-                 t.kind, t.label, t.rssi, t.count);
-        uint16_t fg = li == cursor            ? TFT_CYAN
+        int n = snprintf(line, sizeof(line), "%c%c%c %s %.13s %d x%u", li == cursor ? '>' : ' ', cflag,
+                         t.persistent ? 'P' : ' ', t.kind, t.label, t.rssi, t.count);
+        if (stale && n > 0 && (size_t)n < sizeof(line)) { // how long gone, e.g. " 3m05s"
+            char ago[16];
+            fmtAgo(now - t.lastMs, ago, sizeof(ago));
+            snprintf(line + n, sizeof(line) - n, " %s", ago);
+        }
+        uint16_t fg = stale                     ? TFT_DARKGREY
+                      : t.persistent            ? TFT_MAGENTA
                       : t.conf == cs::CONF_HIGH ? TFT_RED
                       : t.conf == cs::CONF_MED  ? TFT_YELLOW
                                                 : TFT_DARKGREY;
-        drawRow(slot, y, line, fg);
+        drawRow(slot, y, line, fg, li == cursor ? TFT_NAVY : TFT_BLACK);
     }
     listTotal = total;
-    drawFooter("SEL details  f filter  ^v select  <-exit");
+    drawFooter("SEL details  f filter  g grey-after  <-exit");
 }
 
 void openDetails() {
@@ -726,6 +824,11 @@ void openDetails() {
 void closeDetails() {
     detailOpen = false;
     Serial.println("[Watch] details closed -> list");
+}
+void cycleStaleKey() {
+    cs::cycleStale();
+    cursor = scroll = 0;
+    Serial.printf("[Watch] grey-after -> %s\n", cs::staleName());
 }
 void cycleFilter() {
     alertFilter = (alertFilter + 1) % 3; // All -> Med+ -> High -> All
@@ -775,6 +878,58 @@ void stopBlePhase() {
     stopBLEStack();
 }
 
+// ── Headless test hooks (serial lines) ───────────────────────────────────────
+// Bruce's serialcmds task is suspended while the watch runs (see ambient_watch()),
+// otherwise it consumes these lines first and rejects them as unknown commands.
+// "sim on" / "sim off": feed a synthetic HIGH tracker (DE:AD:BE:EF:00:01) every
+// 20 s straight into onEvent() (main loop only, so no race with the radio-side
+// ring producers). "dump": print the table. "g": cycle grey-after. Lets the
+// STALE / PERSISTENT transitions be verified with no real device around.
+bool simOn = false;
+uint32_t simLast = 0;
+void simTick() {
+    if (!simOn || millis() - simLast < 20000) return;
+    simLast = millis();
+    Event e = {};
+    strlcpy(e.addr, "DE:AD:BE:EF:00:01", sizeof(e.addr));
+    strlcpy(e.name, "SIM", sizeof(e.name));
+    e.rssi = -60;
+    e.ble = true;
+    e.frame = FR_BLE_ADV;
+    e.addrType = 1;
+    e.company = 0xFFFF;
+    e.hit.hit = true;
+    strlcpy(e.hit.kind, "TRACKER", sizeof(e.hit.kind));
+    strlcpy(e.hit.label, "SIM test tracker", sizeof(e.hit.label));
+    e.hit.conf = cs::CONF_HIGH;
+    onEvent(e);
+}
+void dumpTable() {
+    uint32_t now = millis();
+    Serial.printf("[Watch] table: %u rows, grey-after %s\n", (unsigned)threatCount, cs::staleName());
+    for (size_t i = 0; i < threatCount; i++) {
+        const Threat &t = threats[i];
+        Serial.printf("[Watch]  %s%s %s %s \"%s\" span %lus min %u x%u silent %lus\n",
+                      t.persistent ? "P" : "-", cs::isStale(t.lastMs, now) ? "S" : "L", t.kind, t.addr,
+                      t.label, (unsigned long)((t.lastMs - t.firstMs) / 1000), t.minutes, t.count,
+                      (unsigned long)((now - t.lastMs) / 1000));
+    }
+}
+void serialCmd() {
+    if (!Serial.available()) return;
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    if (line == "sim on") {
+        simOn = true;
+        simLast = 0;
+        Serial.println("[Watch] sim ON (synthetic tracker every 20 s)");
+    } else if (line == "sim off") {
+        simOn = false;
+        Serial.println("[Watch] sim OFF");
+    } else if (line == "dump") dumpTable();
+    else if (line == "g") cycleStaleKey();
+}
+
 // Last typed character on keyboard boards, 0 if none. (Backspace needs no
 // handling here: the board's input handler already turns it into EscPress.)
 char typedKey() {
@@ -806,10 +961,13 @@ void ambient_watch() {
     alertFilter = cs::CONF_MED;
     alertUntil = 0;
     alertKind[0] = 0;
+    simOn = false;
     g_resting = false;
     fullClear = true;
 
     wifi_mode_t prevMode = WiFi.getMode();
+    // Own the serial port for the test hooks (serialCmd); resumed on exit.
+    if (serialcmdsTaskHandle) vTaskSuspend(serialcmdsTaskHandle);
 
     constexpr uint32_t WIFI_PHASE_MS = 8000;
     constexpr uint32_t BLE_PHASE_MS = 6000;
@@ -819,7 +977,7 @@ void ambient_watch() {
     bool blePhase = false;
     uint8_t chIdx = 0;
     startWifiPhase(chIdx);
-    uint32_t phaseStart = millis(), lastHop = millis();
+    uint32_t phaseStart = millis(), lastHop = millis(), lastStaleCheck = millis();
     awDraw(blePhase, wifi_channels[chIdx]);
 
     for (;;) {
@@ -831,8 +989,14 @@ void ambient_watch() {
         Event ev;
         int drained = 0;
         while (drained++ < 32 && ringPop(ev)) onEvent(ev);
+        serialCmd();
+        simTick();
 
         uint32_t now = millis();
+        if (now - lastStaleCheck >= 1000) {
+            lastStaleCheck = now;
+            reportStale();
+        }
         // WiFi channel hop within the WiFi phase.
         if (!blePhase && !g_resting && now - lastHop > HOP_MS) {
             lastHop = now;
@@ -869,6 +1033,7 @@ void ambient_watch() {
         char key = typedKey();
         if (key == 'F') key = 'f';
         if (key == 'B') key = 'b';
+        if (key == 'G') key = 'g';
         if (detailOpen) {
             if (key == 'b') closeDetails();
             if (check(PrevPress)) detailScroll--;
@@ -876,6 +1041,7 @@ void ambient_watch() {
             check(SelPress); // swallow: SEL has no meaning here
         } else {
             if (key == 'f') cycleFilter();
+            if (key == 'g') cycleStaleKey();
             if (check(SelPress)) openDetails();
             if (check(PrevPress) && cursor > 0) cursor--;
             if (check(NextPress)) cursor++;
@@ -888,6 +1054,7 @@ void ambient_watch() {
     if (blePhase) stopBlePhase();
     else if (!g_resting) stopWifiPhase(false); // during REST both radios are already idle
     freeThreats();
+    if (serialcmdsTaskHandle) vTaskResume(serialcmdsTaskHandle);
     WiFi.mode(prevMode);
     Serial.printf("[Watch] stopped. threats=%u wifiFrames=%lu dropped=%lu\n",
                   (unsigned)threatCount, (unsigned long)wifiFrames, (unsigned long)ringDropped);

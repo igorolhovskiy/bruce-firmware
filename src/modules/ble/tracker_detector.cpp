@@ -2,6 +2,7 @@
 
 #include "core/display.h"
 #include "core/mykeyboard.h"
+#include "modules/wifi/cs_classify.h"
 #include "core/sd_functions.h"
 #include "modules/ble/ble_common.h"
 #include <globals.h>
@@ -373,6 +374,7 @@ void drawBody() {
                       (e.separated ? "!" : " ") + " " + tail + "  " + fmtSpan(dur) + " x" +
                       String(e.count) + " " + fmtSpan(now - e.lastMs) + " " + String(e.rssi);
         uint16_t fg = li == cursor        ? TFT_CYAN
+                      : cs::isStale(e.lastMs, now) ? TFT_DARKGREY
                       : (dur >= PERSIST_MS) ? TFT_RED
                       : (e.separated)       ? TFT_YELLOW
                                             : TFT_WHITE;

@@ -67,6 +67,20 @@ void explainWhy(uint8_t why, uint16_t whyArg, char *out, size_t outsz);
 // What a threat kind ("CAM", "FLOCK", ...) actually is, in a few words.
 const char *kindDescription(const char *kind);
 
+// ── Stale ("passed by") threshold ───────────────────────────────────────────
+// A listed device not heard for this long is drawn grey and sorted below the
+// live ones, so things that were merely on the way (a car, a passer-by's phone)
+// stop drawing attention while staying in the list for reference. Session-wide
+// and shared by every Detector tool; cycled in Ambient Watch with 'g'.
+// Default 2 min - see the rationale next to STALE_STEPS in cs_classify.cpp.
+uint32_t staleMs(); // 0 = greying off
+const char *staleName();
+void cycleStale();
+inline bool isStale(uint32_t lastMs, uint32_t now) {
+    uint32_t s = staleMs();
+    return s && now - lastMs > s;
+}
+
 // Offline self-test (serial-mirrored). Returns true on pass.
 bool runCsClassifySelfTest();
 

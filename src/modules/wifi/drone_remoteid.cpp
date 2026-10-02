@@ -2,6 +2,7 @@
 
 #include "core/display.h"
 #include "core/mykeyboard.h"
+#include "modules/wifi/cs_classify.h"
 #include "core/sd_functions.h"
 #include "modules/ble/ble_common.h"
 #include <WiFi.h>
@@ -452,7 +453,10 @@ void drawTable() {
         String line = String(li == cursor ? '>' : ' ') + String(srcTag(d.srcType)) + " " + id + " " +
                       String(uaTypeName(d.uaType)).substring(0, 6) + " " + flags + " " + String(d.rssi) +
                       " x" + String(d.count);
-        uint16_t fg = li == cursor ? TFT_CYAN : (d.haveOp ? TFT_RED : TFT_WHITE);
+        uint16_t fg = li == cursor                     ? TFT_CYAN
+                      : cs::isStale(d.lastMs, millis()) ? TFT_DARKGREY
+                      : d.haveOp                        ? TFT_RED
+                                                        : TFT_WHITE;
         drawRow(slot, y, line, fg);
     }
 }

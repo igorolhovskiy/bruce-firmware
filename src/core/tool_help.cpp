@@ -99,7 +99,11 @@ const ToolHelp DET_TOOLS[] = {
      "The all-in-one watch. Time-slices WiFi + BLE and collects every threat below "
      "into ONE list, sorted by confidence.\n\nf: confidence filter (All/Med+/High). "
      "SEL: details. A High hit raises an alert banner. Logs to /BruceDetector/"
-     "watch.csv. Passive."},
+     "watch.csv. Passive.\n\ng: grey-after (1m/2m/5m/10m/off, default 2m). A device "
+     "not heard for that long is greyed and sinks - it passed by. It re-lights if "
+     "heard again. Shared with the other Detector lists.\n\nP / magenta = PERSISTENT: heard "
+     "over 10+ min in 6+ distinct minutes. Moving? It is following you. Staying put? "
+     "Probably fixed nearby."},
     {"Tracker Detector",
      "Finds BLE item trackers that may be following you: Apple Find My/AirTag, "
      "Samsung SmartTag, Tile.\n\nHint: AirTags rotate their address, so a moving "

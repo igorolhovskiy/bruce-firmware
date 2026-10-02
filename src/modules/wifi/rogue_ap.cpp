@@ -2,6 +2,7 @@
 
 #include "core/display.h"
 #include "core/mykeyboard.h"
+#include "modules/wifi/cs_classify.h"
 #include "core/sd_functions.h"
 #include <WiFi.h>
 #include <esp_wifi.h>
@@ -447,7 +448,8 @@ void drawBody() {
             String extra = (ap.reason & R_KARMA) ? (" #" + String(ap.distinctSsids)) : "";
             String line = String(sel) + rc + " " + ssid + extra + " c" + String(ap.ch) + " " +
                           String(ap.rssi) + " " + macStr(ap.bssid).substring(9);
-            drawRow(slot, y, line, li == cursor ? TFT_CYAN : TFT_RED);
+            drawRow(slot, y, line,
+                    li == cursor ? TFT_CYAN : cs::isStale(ap.lastMs, millis()) ? TFT_DARKGREY : TFT_RED);
         } else {
             const DeauthSrc &s = deauthSrcs[list[li].idx];
             String line = String(sel) + "D deauth " + macStr(s.mac).substring(9) + " x" + String(s.count);
